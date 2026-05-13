@@ -15,6 +15,7 @@ if [ -f /Library/LaunchDaemons/com.example.proxyswitcher.helper.plist ]; then
 	launchctl unload /Library/LaunchDaemons/com.example.proxyswitcher.helper.plist >/dev/null 2>&1 || true
 	rm -f /Library/LaunchDaemons/com.example.proxyswitcher.helper.plist
 fi
+launchctl remove com.example.proxyswitcher.helper >/dev/null 2>&1 || true
 
 if [ -f /Library/LaunchDaemons/codes.var.tweak.proxyswitcher.helper.plist ]; then
 	chown root:wheel /Library/LaunchDaemons/codes.var.tweak.proxyswitcher.helper.plist 2>/dev/null || chown root:root /Library/LaunchDaemons/codes.var.tweak.proxyswitcher.helper.plist

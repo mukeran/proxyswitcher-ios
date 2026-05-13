@@ -86,6 +86,7 @@ static UIImage *transparentImage() {
     
     NSArray<PSProxyProfile *> *profiles = [[PSProxyManager sharedManager] profiles];
     NSString *activeIdentifier = [[PSProxyManager sharedManager] activeIdentifier];
+    PSProxyProfile *temporaryProfile = [[PSProxyManager sharedManager] temporaryProfile];
     
     __weak typeof(self) weakSelf = self;
     
@@ -94,7 +95,8 @@ static UIImage *transparentImage() {
     if (@available(iOS 13.0, *)) {
         directGlyph = [activeIdentifier isEqualToString:PSProxyDirectIdentifier] ? [UIImage systemImageNamed:@"checkmark"] : transparentImage();
     }
-    [self addActionWithTitle:@"Direct" glyph:directGlyph handler:^{
+    NSString *directSubtitle = temporaryProfile ? [NSString stringWithFormat:@"Current: %@:%ld", temporaryProfile.host, (long)temporaryProfile.port] : @"No HTTP proxy";
+    [self addActionWithTitle:@"Direct" subtitle:directSubtitle glyph:directGlyph handler:^{
         [weakSelf applyDirect];
     }];
     

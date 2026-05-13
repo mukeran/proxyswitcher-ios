@@ -12,5 +12,13 @@
 	<true/>
 	<key>com.apple.private.security.storage.AppDataContainers</key>
 	<true/>
+	<key>com.apple.developer.networking.wifi-info</key>
+	<true/>
+	<key>com.apple.developer.networking.HotspotConfiguration</key>
+	<true/>
+	<key>com.apple.developer.networking.HotspotHelper</key>
+	<true/>
+	<key>com.apple.wifi.manager-access</key>
+	<true/>
 </dict>
 </plist>

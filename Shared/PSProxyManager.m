@@ -5,15 +5,19 @@
 #import <notify.h>
 #import <spawn.h>
 #import <errno.h>
+#import <objc/message.h>
 #import <string.h>
 #import <sys/wait.h>
 
 NSString * const PSProxyDirectIdentifier = @"direct";
+NSString * const PSProxyTemporaryIdentifier = @"temporary";
 NSString * const PSProxyProfilesChangedNotification = @"codes.var.tweak.proxyswitcher.profiles.changed";
 NSString * const PSProxyRequestNotification = @"codes.var.tweak.proxyswitcher.request";
 
 static NSString * const PSProfilesKey = @"profiles";
 static NSString * const PSActiveIdentifierKey = @"activeIdentifier";
+static NSString * const PSTemporaryProfileKey = @"temporaryProfile";
+static NSString * const PSQuickWiFiSSIDsKey = @"quickWiFiSSIDs";
 
 static NSString *PSRootfsPath(NSString *path) {
 	if ([[NSFileManager defaultManager] fileExistsAtPath:[@"/rootfs" stringByAppendingString:path]]) {
@@ -60,6 +64,52 @@ static BOOL PSWritePropertyList(id plist, NSString *path) {
 	return data ? [data writeToFile:path atomically:YES] : NO;
 }
 
+static NSString *PSStringFromSSIDData(NSData *data) {
+	if (![data isKindOfClass:NSData.class] || data.length == 0) {
+		return nil;
+	}
+	NSString *ssid = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+	return ssid.length > 0 ? ssid : nil;
+}
+
+static NSString *PSSSIDFromKnownNetworkKey(NSString *key) {
+	static NSString *prefix = @"wifi.network.ssid.";
+	return [key hasPrefix:prefix] ? [key substringFromIndex:prefix.length] : key;
+}
+
+static PSProxyProfile *PSProxyProfileFromSystemDictionary(NSDictionary *dictionary, NSString *name) {
+	if (![dictionary isKindOfClass:NSDictionary.class]) {
+		return nil;
+	}
+	NSString *type = [dictionary[@"ProxyType"] isKindOfClass:NSString.class] ? dictionary[@"ProxyType"] : nil;
+	NSString *host = [dictionary[@"ProxyServer"] isKindOfClass:NSString.class] ? dictionary[@"ProxyServer"] : nil;
+	id portObject = dictionary[@"ProxyServerPort"];
+	if (![type isEqualToString:@"Manual"] || host.length == 0 || ![portObject respondsToSelector:@selector(integerValue)]) {
+		return nil;
+	}
+	NSInteger port = [portObject integerValue];
+	if (port < 1 || port > 65535) {
+		return nil;
+	}
+	PSProxyProfile *profile = [[PSProxyProfile alloc] init];
+	profile.identifier = PSProxyTemporaryIdentifier;
+	profile.name = name.length > 0 ? name : [NSString stringWithFormat:@"%@:%ld", host, (long)port];
+	profile.host = host;
+	profile.port = port;
+	profile.username = [dictionary[@"ProxyUsername"] isKindOfClass:NSString.class] ? dictionary[@"ProxyUsername"] : nil;
+	profile.password = [dictionary[@"ProxyPassword"] isKindOfClass:NSString.class] ? dictionary[@"ProxyPassword"] : nil;
+	return profile;
+}
+
+static BOOL PSProxyProfilesEqual(PSProxyProfile *lhs, PSProxyProfile *rhs) {
+	if (!lhs || !rhs) {
+		return NO;
+	}
+	BOOL usernameEqual = (lhs.username.length == 0 && rhs.username.length == 0) || [lhs.username isEqualToString:rhs.username];
+	BOOL passwordEqual = (lhs.password.length == 0 && rhs.password.length == 0) || [lhs.password isEqualToString:rhs.password];
+	return [lhs.host isEqualToString:rhs.host] && lhs.port == rhs.port && usernameEqual && passwordEqual;
+}
+
 #ifndef PROXYSWITCHER_HELPER
 static NSString *PSJailbreakPath(NSString *path) {
 #ifdef THEOS_PACKAGE_SCHEME_ROOTHIDE
@@ -100,6 +150,91 @@ typedef Boolean (*PSPrefsUnlockFn)(CFTypeRef prefs);
 static void *PSSystemConfigurationSymbol(const char *name) {
 	return dlsym(RTLD_DEFAULT, name);
 }
+
+static void *PSMobileWiFiSymbol(const char *name) {
+	static void *handle;
+	static dispatch_once_t onceToken;
+	dispatch_once(&onceToken, ^{
+		handle = dlopen("/System/Library/PrivateFrameworks/MobileWiFi.framework/MobileWiFi", RTLD_LAZY);
+	});
+	return handle ? dlsym(handle, name) : NULL;
+}
+
+#ifdef PROXYSWITCHER_HELPER
+static BOOL PSSwitchToWiFiSSIDUsingCoreWiFi(NSString *ssid, NSError **error) {
+	dlopen("/System/Library/PrivateFrameworks/CoreWiFi.framework/CoreWiFi", RTLD_LAZY);
+	Class interfaceClass = NSClassFromString(@"CWFInterface");
+	Class autoJoinParametersClass = NSClassFromString(@"CWFAutoJoinParameters");
+	Class assocParametersClass = NSClassFromString(@"CWFAssocParameters");
+	if (!interfaceClass || !autoJoinParametersClass) {
+		return NO;
+	}
+
+	id interface = ((id (*)(id, SEL))objc_msgSend)(((id (*)(id, SEL))objc_msgSend)(interfaceClass, @selector(alloc)), @selector(init));
+	if (!interface) {
+		return NO;
+	}
+	if ([interface respondsToSelector:@selector(activate)]) {
+		((void (*)(id, SEL))objc_msgSend)(interface, @selector(activate));
+	}
+
+	NSArray *profiles = nil;
+	if ([interface respondsToSelector:@selector(knownNetworkProfilesWithProperties:)]) {
+		profiles = ((id (*)(id, SEL, id))objc_msgSend)(interface, @selector(knownNetworkProfilesWithProperties:), nil);
+	}
+	id targetProfile = nil;
+	for (id profile in profiles) {
+		NSString *profileSSID = nil;
+		if ([profile respondsToSelector:@selector(SSID)]) {
+			profileSSID = ((id (*)(id, SEL))objc_msgSend)(profile, @selector(SSID));
+		}
+		if (profileSSID.length == 0 && [profile respondsToSelector:@selector(ssid)]) {
+			profileSSID = ((id (*)(id, SEL))objc_msgSend)(profile, @selector(ssid));
+		}
+		if ([profileSSID isEqualToString:ssid]) {
+			targetProfile = profile;
+			break;
+		}
+	}
+	if (!targetProfile) {
+		return NO;
+	}
+
+	NSError *joinError = nil;
+	id autoJoinParameters = ((id (*)(id, SEL))objc_msgSend)(((id (*)(id, SEL))objc_msgSend)(autoJoinParametersClass, @selector(alloc)), @selector(init));
+	if ([autoJoinParameters respondsToSelector:@selector(setTargetNetworkProfile:)]) {
+		((void (*)(id, SEL, id))objc_msgSend)(autoJoinParameters, @selector(setTargetNetworkProfile:), targetProfile);
+	}
+	if ([autoJoinParameters respondsToSelector:@selector(setMode:)]) {
+		((void (*)(id, SEL, NSInteger))objc_msgSend)(autoJoinParameters, @selector(setMode:), 1);
+	}
+	if ([autoJoinParameters respondsToSelector:@selector(setTrigger:)]) {
+		((void (*)(id, SEL, NSInteger))objc_msgSend)(autoJoinParameters, @selector(setTrigger:), 1);
+	}
+	if ([interface respondsToSelector:@selector(performAutoJoinWithParameters:error:)]) {
+		BOOL ok = ((BOOL (*)(id, SEL, id, NSError **))objc_msgSend)(interface, @selector(performAutoJoinWithParameters:error:), autoJoinParameters, &joinError);
+		if (ok) {
+			return YES;
+		}
+	}
+
+	if (assocParametersClass && [interface respondsToSelector:@selector(associateWithParameters:error:)]) {
+		id assocParameters = ((id (*)(id, SEL))objc_msgSend)(((id (*)(id, SEL))objc_msgSend)(assocParametersClass, @selector(alloc)), @selector(init));
+		if ([assocParameters respondsToSelector:@selector(setKnownNetworkProfile:)]) {
+			((void (*)(id, SEL, id))objc_msgSend)(assocParameters, @selector(setKnownNetworkProfile:), targetProfile);
+		}
+		BOOL ok = ((BOOL (*)(id, SEL, id, NSError **))objc_msgSend)(interface, @selector(associateWithParameters:error:), assocParameters, &joinError);
+		if (ok) {
+			return YES;
+		}
+	}
+
+	if (error && joinError) {
+		*error = joinError;
+	}
+	return NO;
+}
+#endif
 
 @implementation PSProxyProfile
 
@@ -172,6 +307,9 @@ static void *PSSystemConfigurationSymbol(const char *name) {
 	return profile;
 }
 
+@end
+
+@implementation PSWiFiNetwork
 @end
 
 @implementation PSProxyManager
@@ -262,7 +400,10 @@ static void *PSSystemConfigurationSymbol(const char *name) {
 }
 
 - (NSString *)activeIdentifier {
-	NSString *identifier = [self storeDictionary][@"ActiveIdentifier"];
+	NSString *identifier = [self storeDictionary][PSActiveIdentifierKey];
+	if (!identifier) {
+		identifier = [self storeDictionary][@"ActiveIdentifier"];
+	}
 	return identifier ?: PSProxyDirectIdentifier;
 }
 
@@ -270,11 +411,32 @@ static void *PSSystemConfigurationSymbol(const char *name) {
 	return [self storeDictionary][@"LastActiveProfileIdentifier"];
 }
 
+- (PSProxyProfile *)temporaryProfile {
+	NSDictionary *dictionary = [self storeDictionary][PSTemporaryProfileKey];
+	return [dictionary isKindOfClass:NSDictionary.class] ? [PSProxyProfile profileWithDictionary:dictionary] : nil;
+}
+
 - (void)setActiveIdentifier:(NSString *)identifier {
 	NSMutableDictionary *store = [self storeDictionary].mutableCopy;
-	store[@"ActiveIdentifier"] = identifier;
-	if (identifier && ![identifier isEqualToString:PSProxyDirectIdentifier]) {
+	store[PSActiveIdentifierKey] = identifier;
+	[store removeObjectForKey:@"ActiveIdentifier"];
+	if (![identifier isEqualToString:PSProxyTemporaryIdentifier]) {
+		[store removeObjectForKey:PSTemporaryProfileKey];
+	}
+	if (identifier && ![identifier isEqualToString:PSProxyDirectIdentifier] && ![identifier isEqualToString:PSProxyTemporaryIdentifier]) {
 		store[@"LastActiveProfileIdentifier"] = identifier;
+	}
+	[self writeStoreDictionary:store];
+}
+
+- (void)setTemporaryProfile:(PSProxyProfile *)profile {
+	NSMutableDictionary *store = [self storeDictionary].mutableCopy;
+	if (profile) {
+		store[PSTemporaryProfileKey] = [profile dictionaryRepresentation];
+		store[PSActiveIdentifierKey] = PSProxyTemporaryIdentifier;
+		[store removeObjectForKey:@"ActiveIdentifier"];
+	} else {
+		[store removeObjectForKey:PSTemporaryProfileKey];
 	}
 	[self writeStoreDictionary:store];
 }
@@ -360,6 +522,218 @@ static void *PSSystemConfigurationSymbol(const char *name) {
 	PSWritePropertyList(knownNetworks, path);
 }
 
+- (NSArray<PSWiFiNetwork *> *)knownWiFiNetworks {
+	NSDictionary *knownNetworks = PSPropertyListAtPath(PSKnownNetworksPath(), NSPropertyListImmutable);
+	if (![knownNetworks isKindOfClass:NSDictionary.class]) {
+		return @[];
+	}
+	NSString *currentSSID = [self currentWiFiSSID];
+	NSMutableArray<PSWiFiNetwork *> *networks = [NSMutableArray array];
+	for (NSString *key in knownNetworks) {
+		NSDictionary *dictionary = [knownNetworks[key] isKindOfClass:NSDictionary.class] ? knownNetworks[key] : nil;
+		if (!dictionary) {
+			continue;
+		}
+		NSString *ssid = PSStringFromSSIDData(dictionary[@"SSID"]) ?: PSSSIDFromKnownNetworkKey(key);
+		if (ssid.length == 0) {
+			continue;
+		}
+		PSWiFiNetwork *network = [[PSWiFiNetwork alloc] init];
+		network.ssid = ssid;
+		network.displayName = ssid;
+		network.proxyProfile = PSProxyProfileFromSystemDictionary(dictionary, ssid);
+		network.current = [ssid isEqualToString:currentSSID];
+		[networks addObject:network];
+	}
+	[networks sortUsingComparator:^NSComparisonResult(PSWiFiNetwork *first, PSWiFiNetwork *second) {
+		if (first.current != second.current) {
+			return first.current ? NSOrderedAscending : NSOrderedDescending;
+		}
+		return [first.displayName localizedCaseInsensitiveCompare:second.displayName];
+	}];
+	return networks.copy;
+}
+
+- (NSArray<PSWiFiNetwork *> *)availableWiFiNetworks {
+#ifdef PROXYSWITCHER_HELPER
+	return [self knownWiFiNetworks];
+#else
+	__autoreleasing NSString *response = nil;
+	NSError *error = nil;
+	if (![self runHelperWithArguments:@[@"listwifi"] response:&response error:&error] || response.length == 0) {
+		return @[];
+	}
+	NSData *data = [response dataUsingEncoding:NSUTF8StringEncoding];
+	NSArray *rawNetworks = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+	if (![rawNetworks isKindOfClass:NSArray.class]) {
+		return @[];
+	}
+	NSString *currentSSID = [self currentWiFiSSID];
+	NSMutableArray<PSWiFiNetwork *> *networks = [NSMutableArray array];
+	for (NSDictionary *dictionary in rawNetworks) {
+		if (![dictionary isKindOfClass:NSDictionary.class]) {
+			continue;
+		}
+		NSString *ssid = [dictionary[@"ssid"] isKindOfClass:NSString.class] ? dictionary[@"ssid"] : nil;
+		if (ssid.length == 0) {
+			continue;
+		}
+		PSWiFiNetwork *network = [[PSWiFiNetwork alloc] init];
+		network.ssid = ssid;
+		network.displayName = [dictionary[@"displayName"] isKindOfClass:NSString.class] ? dictionary[@"displayName"] : ssid;
+		NSDictionary *proxy = [dictionary[@"proxy"] isKindOfClass:NSDictionary.class] ? dictionary[@"proxy"] : nil;
+		network.proxyProfile = proxy ? [PSProxyProfile profileWithDictionary:proxy] : nil;
+		network.current = [ssid isEqualToString:currentSSID];
+		[networks addObject:network];
+	}
+	return networks.copy;
+#endif
+}
+
+- (NSArray<NSString *> *)quickWiFiSSIDs {
+	NSArray *ssids = [self storeDictionary][PSQuickWiFiSSIDsKey];
+	return [ssids isKindOfClass:NSArray.class] ? ssids : @[];
+}
+
+- (NSArray<PSWiFiNetwork *> *)quickWiFiNetworks {
+	NSArray<NSString *> *quickSSIDs = [self quickWiFiSSIDs];
+	if (quickSSIDs.count == 0) {
+		return @[];
+	}
+	NSDictionary<NSString *, PSWiFiNetwork *> *availableBySSID = nil;
+	NSMutableDictionary *map = [NSMutableDictionary dictionary];
+	for (PSWiFiNetwork *network in [self availableWiFiNetworks]) {
+		if (network.ssid.length > 0) {
+			map[network.ssid] = network;
+		}
+	}
+	availableBySSID = map.copy;
+	NSMutableArray<PSWiFiNetwork *> *networks = [NSMutableArray array];
+	NSString *currentSSID = [self currentWiFiSSID];
+	for (NSString *ssid in quickSSIDs) {
+		if (![ssid isKindOfClass:NSString.class] || ssid.length == 0) {
+			continue;
+		}
+		PSWiFiNetwork *network = availableBySSID[ssid];
+		if (!network) {
+			network = [[PSWiFiNetwork alloc] init];
+			network.ssid = ssid;
+			network.displayName = ssid;
+		}
+		network.current = [ssid isEqualToString:currentSSID];
+		[networks addObject:network];
+	}
+	return networks.copy;
+}
+
+- (void)addQuickWiFiSSID:(NSString *)ssid {
+	if (ssid.length == 0) {
+		return;
+	}
+	NSMutableDictionary *store = [self storeDictionary].mutableCopy;
+	NSMutableArray *ssids = [[store[PSQuickWiFiSSIDsKey] isKindOfClass:NSArray.class] ? store[PSQuickWiFiSSIDsKey] : @[] mutableCopy];
+	if (![ssids containsObject:ssid]) {
+		[ssids addObject:ssid];
+		store[PSQuickWiFiSSIDsKey] = ssids;
+		[self writeStoreDictionary:store];
+	}
+}
+
+- (void)deleteQuickWiFiSSID:(NSString *)ssid {
+	if (ssid.length == 0) {
+		return;
+	}
+	NSMutableDictionary *store = [self storeDictionary].mutableCopy;
+	NSArray *rawSSIDs = [store[PSQuickWiFiSSIDsKey] isKindOfClass:NSArray.class] ? store[PSQuickWiFiSSIDsKey] : @[];
+	NSMutableArray *remaining = [NSMutableArray array];
+	for (NSString *candidate in rawSSIDs) {
+		if (![candidate isEqualToString:ssid]) {
+			[remaining addObject:candidate];
+		}
+	}
+	store[PSQuickWiFiSSIDsKey] = remaining;
+	[self writeStoreDictionary:store];
+}
+
+- (PSProxyProfile *)currentSystemProxyProfile {
+	NSString *serviceIdentifier = [self currentWiFiServiceIdentifier];
+	if (serviceIdentifier.length == 0) {
+		return nil;
+	}
+
+	PSPrefsCreateFn prefsCreate = (PSPrefsCreateFn)PSSystemConfigurationSymbol("SCPreferencesCreate");
+	PSServiceCopyAllFn serviceCopyAll = (PSServiceCopyAllFn)PSSystemConfigurationSymbol("SCNetworkServiceCopyAll");
+	PSServiceGetServiceIDFn serviceGetServiceID = (PSServiceGetServiceIDFn)PSSystemConfigurationSymbol("SCNetworkServiceGetServiceID");
+	PSServiceCopyProtocolFn serviceCopyProtocol = (PSServiceCopyProtocolFn)PSSystemConfigurationSymbol("SCNetworkServiceCopyProtocol");
+	PSProtocolGetConfigurationFn protocolGetConfiguration = (PSProtocolGetConfigurationFn)PSSystemConfigurationSymbol("SCNetworkProtocolGetConfiguration");
+	if (!prefsCreate || !serviceCopyAll || !serviceGetServiceID || !serviceCopyProtocol || !protocolGetConfiguration) {
+		return nil;
+	}
+
+	CFTypeRef preferences = prefsCreate(NULL, CFSTR("ProxySwitcher"), NULL);
+	if (!preferences) {
+		return nil;
+	}
+	PSProxyProfile *profile = nil;
+	NSArray *services = CFBridgingRelease(serviceCopyAll(preferences));
+	for (id serviceObject in services) {
+		CFTypeRef service = (__bridge CFTypeRef)serviceObject;
+		NSString *identifier = (__bridge NSString *)serviceGetServiceID(service);
+		if (![identifier isEqualToString:serviceIdentifier]) {
+			continue;
+		}
+		CFTypeRef protocol = serviceCopyProtocol(service, CFSTR("Proxies"));
+		if (!protocol) {
+			break;
+		}
+		CFDictionaryRef configurationRef = protocolGetConfiguration(protocol);
+		NSDictionary *configuration = configurationRef ? (__bridge NSDictionary *)configurationRef : nil;
+		if ([configuration[@"HTTPEnable"] boolValue] && [configuration[@"HTTPProxy"] isKindOfClass:NSString.class] && [configuration[@"HTTPPort"] respondsToSelector:@selector(integerValue)]) {
+			PSProxyProfile *temporary = [[PSProxyProfile alloc] init];
+			temporary.identifier = PSProxyTemporaryIdentifier;
+			temporary.name = [self currentWiFiSSID] ?: @"Current Wi-Fi";
+			temporary.host = configuration[@"HTTPProxy"];
+			temporary.port = [configuration[@"HTTPPort"] integerValue];
+			profile = temporary;
+		}
+		CFRelease(protocol);
+		break;
+	}
+	CFRelease(preferences);
+	return profile;
+}
+
+- (BOOL)syncActiveProfileWithCurrentSystemProxy:(NSError **)error {
+	PSProxyProfile *systemProfile = [self currentSystemProxyProfile];
+	NSString *targetIdentifier = PSProxyDirectIdentifier;
+	PSProxyProfile *temporaryProfile = nil;
+	if (systemProfile) {
+		for (PSProxyProfile *profile in [self profiles]) {
+			if (PSProxyProfilesEqual(profile, systemProfile)) {
+				targetIdentifier = profile.identifier;
+				break;
+			}
+		}
+		if ([targetIdentifier isEqualToString:PSProxyDirectIdentifier]) {
+			temporaryProfile = systemProfile;
+			temporaryProfile.name = [NSString stringWithFormat:@"%@:%ld", systemProfile.host, (long)systemProfile.port];
+			targetIdentifier = PSProxyTemporaryIdentifier;
+		}
+	}
+
+	NSString *activeIdentifier = [self activeIdentifier];
+	PSProxyProfile *existingTemporary = [self temporaryProfile];
+	if ([activeIdentifier isEqualToString:targetIdentifier] && (!temporaryProfile || PSProxyProfilesEqual(existingTemporary, temporaryProfile))) {
+		return YES;
+	}
+	if (temporaryProfile) {
+		[self setTemporaryProfile:temporaryProfile];
+	} else {
+		[self setActiveIdentifier:targetIdentifier];
+	}
+	return YES;
+}
+
 - (BOOL)applyDirectWithError:(NSError **)error {
 #ifndef PROXYSWITCHER_HELPER
 	BOOL ok = [self runHelperWithArguments:@[@"direct"] error:error];
@@ -401,8 +775,125 @@ static void *PSSystemConfigurationSymbol(const char *name) {
 #endif
 }
 
+- (BOOL)switchToWiFiSSID:(NSString *)ssid error:(NSError **)error {
+	if (ssid.length == 0) {
+		if (error) {
+			*error = [NSError errorWithDomain:@"ProxySwitcher" code:30 userInfo:@{NSLocalizedDescriptionKey: @"Wi-Fi SSID is empty."}];
+		}
+		return NO;
+	}
+#ifndef PROXYSWITCHER_HELPER
+	return [self runHelperWithArguments:@[@"wifi", ssid] error:error];
+#else
+	typedef CFTypeRef (*WiFiManagerClientCreateFn)(CFAllocatorRef allocator, int flags);
+	typedef CFArrayRef (*WiFiManagerClientCopyDevicesFn)(CFTypeRef manager);
+	typedef CFArrayRef (*WiFiManagerClientCopyNetworksFn)(CFTypeRef manager);
+	typedef CFArrayRef (*WiFiManagerClientCopyEnabledNetworksFn)(CFTypeRef manager);
+	typedef CFArrayRef (*WiFiManagerClientCopyMutableNetworksFn)(CFTypeRef manager);
+	typedef CFStringRef (*WiFiNetworkGetSSIDFn)(CFTypeRef network);
+	typedef int (*WiFiDeviceClientAssociateAsyncFn)(CFTypeRef device, CFTypeRef network, CFDictionaryRef options, void *callback, void *context);
+
+	WiFiManagerClientCreateFn managerCreate = (WiFiManagerClientCreateFn)PSMobileWiFiSymbol("WiFiManagerClientCreate");
+	WiFiManagerClientCopyDevicesFn copyDevices = (WiFiManagerClientCopyDevicesFn)PSMobileWiFiSymbol("WiFiManagerClientCopyDevices");
+	WiFiManagerClientCopyNetworksFn copyNetworks = (WiFiManagerClientCopyNetworksFn)PSMobileWiFiSymbol("WiFiManagerClientCopyNetworks");
+	WiFiManagerClientCopyEnabledNetworksFn copyEnabledNetworks = (WiFiManagerClientCopyEnabledNetworksFn)PSMobileWiFiSymbol("WiFiManagerClientCopyEnabledNetworks");
+	WiFiManagerClientCopyMutableNetworksFn copyMutableNetworks = (WiFiManagerClientCopyMutableNetworksFn)PSMobileWiFiSymbol("WiFiManagerClientCopyMutableNetworks");
+	WiFiNetworkGetSSIDFn networkGetSSID = (WiFiNetworkGetSSIDFn)PSMobileWiFiSymbol("WiFiNetworkGetSSID");
+	WiFiDeviceClientAssociateAsyncFn associateAsync = (WiFiDeviceClientAssociateAsyncFn)PSMobileWiFiSymbol("WiFiDeviceClientAssociateAsync");
+	if (!managerCreate || !copyDevices || !networkGetSSID || !associateAsync || (!copyNetworks && !copyEnabledNetworks && !copyMutableNetworks)) {
+		if (error) {
+			*error = [NSError errorWithDomain:@"ProxySwitcher" code:31 userInfo:@{NSLocalizedDescriptionKey: @"Required MobileWiFi symbols are unavailable."}];
+		}
+		return NO;
+	}
+
+	CFTypeRef manager = managerCreate(NULL, 0);
+	if (!manager) {
+		if (error) {
+			*error = [NSError errorWithDomain:@"ProxySwitcher" code:32 userInfo:@{NSLocalizedDescriptionKey: @"Unable to open MobileWiFi manager."}];
+		}
+		return NO;
+	}
+
+	NSArray *devices = CFBridgingRelease(copyDevices(manager));
+	CFTypeRef device = devices.count > 0 ? (__bridge CFTypeRef)devices.firstObject : NULL;
+	CFTypeRef targetNetwork = NULL;
+	NSArray *networkLists = @[
+		copyMutableNetworks ? CFBridgingRelease(copyMutableNetworks(manager)) ?: @[] : @[],
+		copyEnabledNetworks ? CFBridgingRelease(copyEnabledNetworks(manager)) ?: @[] : @[],
+		copyNetworks ? CFBridgingRelease(copyNetworks(manager)) ?: @[] : @[]
+	];
+	for (NSArray *networks in networkLists) {
+		if (![networks isKindOfClass:NSArray.class]) {
+			continue;
+		}
+		for (id networkObject in networks) {
+			CFTypeRef network = (__bridge CFTypeRef)networkObject;
+			NSString *networkSSID = (__bridge NSString *)networkGetSSID(network);
+			if ([networkSSID isEqualToString:ssid]) {
+				targetNetwork = network;
+				break;
+			}
+		}
+		if (targetNetwork) {
+			break;
+		}
+	}
+	if (!device || !targetNetwork) {
+		NSError *coreWiFiError = nil;
+		if (PSSwitchToWiFiSSIDUsingCoreWiFi(ssid, &coreWiFiError)) {
+			NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:15.0];
+			while ([deadline timeIntervalSinceNow] > 0) {
+				if ([[self currentWiFiSSID] isEqualToString:ssid]) {
+					[NSThread sleepForTimeInterval:1.0];
+					[self syncActiveProfileWithCurrentSystemProxy:nil];
+					CFRelease(manager);
+					return YES;
+				}
+				[NSThread sleepForTimeInterval:0.5];
+			}
+			[self syncActiveProfileWithCurrentSystemProxy:nil];
+			CFRelease(manager);
+			return YES;
+		}
+		if (error) {
+			*error = coreWiFiError ?: [NSError errorWithDomain:@"ProxySwitcher" code:33 userInfo:@{NSLocalizedDescriptionKey: @"Saved Wi-Fi network was not found."}];
+		}
+		CFRelease(manager);
+		return NO;
+	}
+
+	int result = associateAsync(device, targetNetwork, NULL, NULL, NULL);
+	if (result != 0) {
+		if (error) {
+			*error = [NSError errorWithDomain:@"ProxySwitcher" code:34 userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"MobileWiFi association failed (%d).", result]}];
+		}
+		CFRelease(manager);
+		return NO;
+	}
+
+	NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:15.0];
+	while ([deadline timeIntervalSinceNow] > 0) {
+		if ([[self currentWiFiSSID] isEqualToString:ssid]) {
+			[NSThread sleepForTimeInterval:1.0];
+			[self syncActiveProfileWithCurrentSystemProxy:nil];
+			CFRelease(manager);
+			return YES;
+		}
+		[NSThread sleepForTimeInterval:0.5];
+	}
+	[self syncActiveProfileWithCurrentSystemProxy:nil];
+	CFRelease(manager);
+	return YES;
+#endif
+}
+
 #ifndef PROXYSWITCHER_HELPER
 - (BOOL)runHelperWithArguments:(NSArray<NSString *> *)arguments error:(NSError **)error {
+	return [self runHelperWithArguments:arguments response:nil error:error];
+}
+
+- (BOOL)runHelperWithArguments:(NSArray<NSString *> *)arguments response:(NSString **)responseMessage error:(NSError **)error {
 	NSString *helperPath = PSHelperPath();
 	if (![[NSFileManager defaultManager] fileExistsAtPath:helperPath]) {
 		if (error) {
@@ -433,6 +924,9 @@ static void *PSSystemConfigurationSymbol(const char *name) {
 		NSArray<NSString *> *lines = [response componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet];
 		if (lines.count >= 2 && [lines[0] isEqualToString:requestIdentifier]) {
 			if ([lines[1] isEqualToString:@"1"]) {
+				if (responseMessage) {
+					*responseMessage = lines.count > 2 ? lines[2] : @"";
+				}
 				return YES;
 			}
 			if (error) {
@@ -450,6 +944,38 @@ static void *PSSystemConfigurationSymbol(const char *name) {
 	return NO;
 }
 #endif
+
+- (NSString *)currentWiFiSSID {
+	typedef CFTypeRef (*WiFiManagerClientCreateFn)(CFAllocatorRef allocator, int flags);
+	typedef CFArrayRef (*WiFiManagerClientCopyDevicesFn)(CFTypeRef manager);
+	typedef CFTypeRef (*WiFiDeviceClientCopyCurrentNetworkFn)(CFTypeRef device);
+	typedef CFStringRef (*WiFiNetworkGetSSIDFn)(CFTypeRef network);
+
+	WiFiManagerClientCreateFn managerCreate = (WiFiManagerClientCreateFn)PSMobileWiFiSymbol("WiFiManagerClientCreate");
+	WiFiManagerClientCopyDevicesFn copyDevices = (WiFiManagerClientCopyDevicesFn)PSMobileWiFiSymbol("WiFiManagerClientCopyDevices");
+	WiFiDeviceClientCopyCurrentNetworkFn copyCurrentNetwork = (WiFiDeviceClientCopyCurrentNetworkFn)PSMobileWiFiSymbol("WiFiDeviceClientCopyCurrentNetwork");
+	WiFiNetworkGetSSIDFn networkGetSSID = (WiFiNetworkGetSSIDFn)PSMobileWiFiSymbol("WiFiNetworkGetSSID");
+	if (managerCreate && copyDevices && copyCurrentNetwork && networkGetSSID) {
+		CFTypeRef manager = managerCreate(NULL, 0);
+		if (manager) {
+			NSArray *devices = CFBridgingRelease(copyDevices(manager));
+			for (id deviceObject in devices) {
+				CFTypeRef network = copyCurrentNetwork((__bridge CFTypeRef)deviceObject);
+				if (!network) {
+					continue;
+				}
+				NSString *ssid = [(__bridge NSString *)networkGetSSID(network) copy];
+				CFRelease(network);
+				if (ssid.length > 0) {
+					CFRelease(manager);
+					return ssid;
+				}
+			}
+			CFRelease(manager);
+		}
+	}
+	return [self currentSetNameFromSystemPreferences];
+}
 
 - (NSString *)currentWiFiServiceIdentifier {
 	PSDStoreCreateFn storeCreate = (PSDStoreCreateFn)PSSystemConfigurationSymbol("SCDynamicStoreCreate");
