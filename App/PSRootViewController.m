@@ -6,7 +6,10 @@
 
 @property (nonatomic, copy) NSArray<PSProxyProfile *> *profiles;
 @property (nonatomic, copy) NSArray<PSWiFiNetwork *> *wifiNetworks;
+@property (nonatomic, copy) NSString *activeIdentifier;
+@property (nonatomic, strong) PSProxyProfile *temporaryProfile;
 @property (nonatomic, assign) int notifyToken;
+@property (nonatomic, assign) NSUInteger reloadGeneration;
 
 @end
 
@@ -15,7 +18,7 @@
 - (void)viewDidLoad {
 	[super viewDidLoad];
 	self.title = @"ProxySwitcher";
-	self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemAdd target:self action:@selector(addProfile)];
+	self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemAdd target:self action:@selector(showAddMenu)];
 	[self.tableView registerClass:UITableViewCell.class forCellReuseIdentifier:@"Cell"];
 	[NSNotificationCenter.defaultCenter addObserver:self selector:@selector(reloadProfiles) name:UIApplicationDidBecomeActiveNotification object:nil];
 	__weak typeof(self) weakSelf = self;
@@ -38,10 +41,26 @@
 }
 
 - (void)reloadProfiles {
-	[[PSProxyManager sharedManager] syncActiveProfileWithCurrentSystemProxy:nil];
-	self.profiles = [[PSProxyManager sharedManager] profiles];
-	self.wifiNetworks = [[PSProxyManager sharedManager] quickWiFiNetworks];
-	[self.tableView reloadData];
+	NSUInteger generation = self.reloadGeneration + 1;
+	self.reloadGeneration = generation;
+	dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+		PSProxyManager *manager = [PSProxyManager sharedManager];
+		[manager syncActiveProfileWithCurrentSystemProxy:nil];
+		NSArray<PSProxyProfile *> *profiles = [manager profiles];
+		NSArray<PSWiFiNetwork *> *wifiNetworks = [manager quickWiFiNetworks];
+		NSString *activeIdentifier = [manager activeIdentifier];
+		PSProxyProfile *temporaryProfile = [manager temporaryProfile];
+		dispatch_async(dispatch_get_main_queue(), ^{
+			if (generation != self.reloadGeneration) {
+				return;
+			}
+			self.profiles = profiles;
+			self.wifiNetworks = wifiNetworks;
+			self.activeIdentifier = activeIdentifier;
+			self.temporaryProfile = temporaryProfile;
+			[self.tableView reloadData];
+		});
+	});
 }
 
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {
@@ -55,7 +74,7 @@
 	if (section == 1) {
 		return self.profiles.count;
 	}
-	return self.wifiNetworks.count + 1;
+	return self.wifiNetworks.count;
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
@@ -81,10 +100,10 @@
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
 	UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"Cell" forIndexPath:indexPath];
 	UIListContentConfiguration *content = UIListContentConfiguration.valueCellConfiguration;
-	NSString *activeIdentifier = [[PSProxyManager sharedManager] activeIdentifier];
+	NSString *activeIdentifier = self.activeIdentifier ?: PSProxyDirectIdentifier;
 
 	if (indexPath.section == 0) {
-		PSProxyProfile *temporaryProfile = [[PSProxyManager sharedManager] temporaryProfile];
+		PSProxyProfile *temporaryProfile = self.temporaryProfile;
 		content.text = @"Direct";
 		content.secondaryText = temporaryProfile ? [NSString stringWithFormat:@"Current Wi-Fi proxy: %@:%ld", temporaryProfile.host, (long)temporaryProfile.port] : @"No HTTP proxy";
 		cell.accessoryType = [activeIdentifier isEqualToString:PSProxyDirectIdentifier] ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
@@ -94,18 +113,10 @@
 		content.secondaryText = [NSString stringWithFormat:@"%@:%ld", profile.host, (long)profile.port];
 		cell.accessoryType = [activeIdentifier isEqualToString:profile.identifier] ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
 	} else {
-		if (indexPath.row == 0) {
-			content = UIListContentConfiguration.cellConfiguration;
-			content.text = @"Add Saved Wi-Fi...";
-			content.image = [UIImage systemImageNamed:@"plus.circle"];
-			cell.accessoryType = UITableViewCellAccessoryNone;
-			cell.contentConfiguration = content;
-			return cell;
-		}
-		PSWiFiNetwork *network = self.wifiNetworks[indexPath.row - 1];
+		PSWiFiNetwork *network = self.wifiNetworks[indexPath.row];
 		content.text = network.displayName;
 		content.secondaryText = network.proxyProfile ? [NSString stringWithFormat:@"Saved proxy: %@:%ld", network.proxyProfile.host, (long)network.proxyProfile.port] : @"Saved proxy: Direct";
-		cell.accessoryType = network.current ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryDisclosureIndicator;
+		cell.accessoryType = network.current ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
 	}
 
 	cell.contentConfiguration = content;
@@ -115,30 +126,47 @@
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
 	[tableView deselectRowAtIndexPath:indexPath animated:YES];
 
-	NSError *error;
-	BOOL ok;
+	void (^operation)(void) = nil;
 	if (indexPath.section == 0) {
-		ok = [[PSProxyManager sharedManager] applyDirectWithError:&error];
+		operation = ^{
+			NSError *error;
+			BOOL ok = [[PSProxyManager sharedManager] applyDirectWithError:&error];
+			[self finishOperationWithSuccess:ok error:error];
+		};
 	} else if (indexPath.section == 1) {
 		PSProxyProfile *profile = self.profiles[indexPath.row];
-		ok = [[PSProxyManager sharedManager] applyProfileWithIdentifier:profile.identifier error:&error];
+		NSString *identifier = profile.identifier;
+		operation = ^{
+			NSError *error;
+			BOOL ok = [[PSProxyManager sharedManager] applyProfileWithIdentifier:identifier error:&error];
+			[self finishOperationWithSuccess:ok error:error];
+		};
 	} else {
-		if (indexPath.row == 0) {
-			[self showWiFiPicker];
-			return;
-		}
-		PSWiFiNetwork *network = self.wifiNetworks[indexPath.row - 1];
-		ok = [[PSProxyManager sharedManager] switchToWiFiSSID:network.ssid error:&error];
+		PSWiFiNetwork *network = self.wifiNetworks[indexPath.row];
+		NSString *ssid = network.ssid;
+		operation = ^{
+			NSError *error;
+			BOOL ok = [[PSProxyManager sharedManager] switchToWiFiSSID:ssid error:&error];
+			[self finishOperationWithSuccess:ok error:error];
+		};
 	}
 
-	if (!ok) {
-		[self showError:error.localizedDescription ?: @"Unable to update proxy settings."];
+	if (operation) {
+		dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), operation);
 	}
-	[self reloadProfiles];
+}
+
+- (void)finishOperationWithSuccess:(BOOL)ok error:(NSError *)error {
+	dispatch_async(dispatch_get_main_queue(), ^{
+		if (!ok) {
+			[self showError:error.localizedDescription ?: @"Unable to update settings."];
+		}
+		[self reloadProfiles];
+	});
 }
 
 - (BOOL)tableView:(UITableView *)tableView canEditRowAtIndexPath:(NSIndexPath *)indexPath {
-	return indexPath.section == 1 || (indexPath.section == 2 && indexPath.row > 0);
+	return indexPath.section == 1 || indexPath.section == 2;
 }
 
 - (void)tableView:(UITableView *)tableView commitEditingStyle:(UITableViewCellEditingStyle)editingStyle forRowAtIndexPath:(NSIndexPath *)indexPath {
@@ -149,7 +177,7 @@
 		PSProxyProfile *profile = self.profiles[indexPath.row];
 		[[PSProxyManager sharedManager] deleteProfileWithIdentifier:profile.identifier];
 	} else {
-		PSWiFiNetwork *network = self.wifiNetworks[indexPath.row - 1];
+		PSWiFiNetwork *network = self.wifiNetworks[indexPath.row];
 		[[PSProxyManager sharedManager] deleteQuickWiFiSSID:network.ssid];
 	}
 	[self reloadProfiles];
@@ -163,8 +191,8 @@
 }
 
 - (UISwipeActionsConfiguration *)tableView:(UITableView *)tableView trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
-	if (indexPath.section == 2 && indexPath.row > 0) {
-		PSWiFiNetwork *network = self.wifiNetworks[indexPath.row - 1];
+	if (indexPath.section == 2) {
+		PSWiFiNetwork *network = self.wifiNetworks[indexPath.row];
 		UIContextualAction *deleteAction = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleDestructive title:@"Delete" handler:^(__kindof UIContextualAction *action, __kindof UIView *sourceView, void (^completionHandler)(BOOL)) {
 			[[PSProxyManager sharedManager] deleteQuickWiFiSSID:network.ssid];
 			[self reloadProfiles];
@@ -184,39 +212,51 @@
 	return [UISwipeActionsConfiguration configurationWithActions:@[deleteAction, [self editActionForProfile:profile]]];
 }
 
-- (void)addProfile {
-	[self showProfileEditorWithProfile:nil];
+- (void)showAddMenu {
+	UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Add" message:nil preferredStyle:UIAlertControllerStyleActionSheet];
+	[alert addAction:[UIAlertAction actionWithTitle:@"Profile" style:UIAlertActionStyleDefault handler:^(__kindof UIAlertAction *action) {
+		[self showProfileEditorWithProfile:nil];
+	}]];
+	[alert addAction:[UIAlertAction actionWithTitle:@"Saved Wi-Fi" style:UIAlertActionStyleDefault handler:^(__kindof UIAlertAction *action) {
+		[self showWiFiPicker];
+	}]];
+	[alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+	[self presentViewController:alert animated:YES completion:nil];
 }
 
 - (void)showWiFiPicker {
-	NSArray<PSWiFiNetwork *> *availableNetworks = [[PSProxyManager sharedManager] availableWiFiNetworks];
 	NSMutableSet *existingSSIDs = [NSMutableSet set];
 	for (PSWiFiNetwork *network in self.wifiNetworks) {
 		if (network.ssid.length > 0) {
 			[existingSSIDs addObject:network.ssid];
 		}
 	}
-	NSMutableArray<PSWiFiNetwork *> *candidates = [NSMutableArray array];
-	for (PSWiFiNetwork *network in availableNetworks) {
-		if (network.ssid.length > 0 && ![existingSSIDs containsObject:network.ssid]) {
-			[candidates addObject:network];
+	dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+		NSArray<PSWiFiNetwork *> *availableNetworks = [[PSProxyManager sharedManager] availableWiFiNetworks];
+		NSMutableArray<PSWiFiNetwork *> *candidates = [NSMutableArray array];
+		for (PSWiFiNetwork *network in availableNetworks) {
+			if (network.ssid.length > 0 && ![existingSSIDs containsObject:network.ssid]) {
+				[candidates addObject:network];
+			}
 		}
-	}
-	if (candidates.count == 0) {
-		[self showError:@"No additional saved Wi-Fi networks were found."];
-		return;
-	}
+		dispatch_async(dispatch_get_main_queue(), ^{
+			if (candidates.count == 0) {
+				[self showError:@"No additional saved Wi-Fi networks were found."];
+				return;
+			}
 
-	UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Add Wi-Fi" message:nil preferredStyle:UIAlertControllerStyleActionSheet];
-	for (PSWiFiNetwork *network in candidates) {
-		NSString *title = network.proxyProfile ? [NSString stringWithFormat:@"%@  %@:%ld", network.displayName, network.proxyProfile.host, (long)network.proxyProfile.port] : network.displayName;
-		[alert addAction:[UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault handler:^(__kindof UIAlertAction *action) {
-			[[PSProxyManager sharedManager] addQuickWiFiSSID:network.ssid];
-			[self reloadProfiles];
-		}]];
-	}
-	[alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-	[self presentViewController:alert animated:YES completion:nil];
+			UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Add Wi-Fi" message:nil preferredStyle:UIAlertControllerStyleActionSheet];
+			for (PSWiFiNetwork *network in candidates) {
+				NSString *title = network.proxyProfile ? [NSString stringWithFormat:@"%@  %@:%ld", network.displayName, network.proxyProfile.host, (long)network.proxyProfile.port] : network.displayName;
+				[alert addAction:[UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault handler:^(__kindof UIAlertAction *action) {
+					[[PSProxyManager sharedManager] addQuickWiFiSSID:network.ssid];
+					[self reloadProfiles];
+				}]];
+			}
+			[alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+			[self presentViewController:alert animated:YES completion:nil];
+		});
+	});
 }
 
 - (void)showProfileEditorWithProfile:(PSProxyProfile *)profile {
