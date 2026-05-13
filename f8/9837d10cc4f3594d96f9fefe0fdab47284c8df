@@ -1,0 +1,49 @@
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "f89837d10cc4f3594d96f9fefe0fdab47284c8df",
+  "prompts": {
+    "793c090bf4feccdb": {
+      "agent_id": {
+        "tool": "trae-cue",
+        "id": "ai_tab-icr-32eeb03c-0e9e-4061-adda-63306c59405e",
+        "model": "default"
+      },
+      "human_author": "Keran Mu <mukeran.25@bytedance.com>",
+      "messages": [],
+      "total_additions": 1,
+      "total_deletions": 1,
+      "accepted_lines": 0,
+      "overriden_lines": 1
+    },
+    "8a46bb4ad4d984ef": {
+      "agent_id": {
+        "tool": "trae-cue",
+        "id": "ai_tab-icr-77aebd5b-5b07-4584-b34e-9942c9fd80dc",
+        "model": "default"
+      },
+      "human_author": "Keran Mu <mukeran.25@bytedance.com>",
+      "messages": [],
+      "total_additions": 1,
+      "total_deletions": 1,
+      "accepted_lines": 0,
+      "overriden_lines": 0
+    },
+    "e631ee01db95ecf8": {
+      "agent_id": {
+        "tool": "trae-cue",
+        "id": "ai_tab-icr-f8c10f8f-91fc-4d8d-9ef8-2a6e7e267db8",
+        "model": "default"
+      },
+      "human_author": "Keran Mu <mukeran.25@bytedance.com>",
+      "messages": [],
+      "total_additions": 1,
+      "total_deletions": 1,
+      "accepted_lines": 0,
+      "overriden_lines": 1
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
