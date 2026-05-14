@@ -3,7 +3,10 @@ TARGET := iphone:clang:latest:16.0
 INSTALL_TARGET_PROCESSES = SpringBoard ProxySwitcher
 
 THEOS_PACKAGE_SCHEME ?= rootless
+PACKAGE_BUILDNAME ?=
 export CLANG_MODULE_CACHE_PATH ?= $(CURDIR)/.theos/module-cache
+# Keep version stable for the same source version; do not auto-increment build numbers.
+PACKAGE_VERSION = $(THEOS_PACKAGE_BASE_VERSION)$(VERSION.EXTRAVERSION)
 
 include $(THEOS)/makefiles/common.mk
 

@@ -15,6 +15,7 @@ extern NSString * const PSProxyHelperSocketPath;
 @property (nonatomic, assign) NSInteger port;
 @property (nonatomic, copy, nullable) NSString *username;
 @property (nonatomic, copy, nullable) NSString *password;
+@property (nonatomic, copy, nullable) NSArray<NSString *> *noProxy;
 
 - (NSDictionary *)dictionaryRepresentation;
 + (nullable instancetype)profileWithDictionary:(NSDictionary *)dictionary;
@@ -42,8 +43,11 @@ extern NSString * const PSProxyHelperSocketPath;
 - (NSString *)activeIdentifier;
 - (nullable NSString *)lastActiveProfileIdentifier;
 - (nullable PSProxyProfile *)temporaryProfile;
+- (nullable PSProxyProfile *)lastTemporaryProfile;
+- (void)clearTemporaryProfile;
 - (BOOL)applyDirectWithError:(NSError **)error;
 - (BOOL)applyProfileWithIdentifier:(NSString *)identifier error:(NSError **)error;
+- (BOOL)applyTemporaryProfileWithError:(NSError **)error;
 - (NSString *)nextIdentifierAfterActive;
 - (NSArray<PSWiFiNetwork *> *)availableWiFiNetworks;
 - (NSArray<PSWiFiNetwork *> *)quickWiFiNetworks;
@@ -52,6 +56,7 @@ extern NSString * const PSProxyHelperSocketPath;
 - (nullable NSString *)currentWiFiSSID;
 - (BOOL)switchToWiFiSSID:(NSString *)ssid error:(NSError **)error;
 - (BOOL)syncActiveProfileWithCurrentSystemProxy:(NSError **)error;
+- (NSDictionary<NSString *, id> *)diagnosticsSnapshot;
 
 @end
 

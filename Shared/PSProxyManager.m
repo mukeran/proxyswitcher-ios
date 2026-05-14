@@ -20,8 +20,20 @@ NSString * const PSProxyHelperSocketPath = @"/private/var/mobile/Library/Prefere
 static NSString * const PSProfilesKey = @"profiles";
 static NSString * const PSActiveIdentifierKey = @"activeIdentifier";
 static NSString * const PSTemporaryProfileKey = @"temporaryProfile";
+static NSString * const PSLastTemporaryProfileKey = @"lastTemporaryProfile";
 static NSString * const PSQuickWiFiSSIDsKey = @"quickWiFiSSIDs";
 static NSString * const PSWiFiServiceIdentifiersKey = @"wifiServiceIdentifiers";
+static NSString * const PSProtocolVersion = @"1";
+static NSString * const PSDiagnosticsErrorDomain = @"ProxySwitcher";
+
+typedef NS_ENUM(NSInteger, PSHelperErrorCode) {
+	PSHelperErrorNotInstalled = 10,
+	PSHelperErrorOperationFailed = 11,
+	PSHelperErrorRequestWriteFailed = 12,
+	PSHelperErrorUnreachable = 13,
+	PSHelperErrorPathTooLong = 14,
+	PSHelperErrorInvalidResponse = 15
+};
 
 #ifndef PROXYSWITCHER_HELPER
 static const NSTimeInterval PSProxyHelperDefaultTimeout = 20.0;
@@ -100,17 +112,6 @@ static BOOL PSWritePropertyList(id plist, NSString *path) {
 	return data ? [data writeToFile:path atomically:YES] : NO;
 }
 
-static void PSDebugWriteState(NSDictionary *state) {
-	NSString *path = @"/private/var/mobile/Library/Preferences/codes.var.tweak.proxyswitcher.debug.plist";
-	NSMutableDictionary *payload = [state isKindOfClass:NSDictionary.class] ? [state mutableCopy] : [NSMutableDictionary dictionary];
-	payload[@"timestamp"] = @([[NSDate date] timeIntervalSince1970]);
-	for (NSString *candidate in PSPathCandidates(path)) {
-		NSString *directory = [candidate stringByDeletingLastPathComponent];
-		[[NSFileManager defaultManager] createDirectoryAtPath:directory withIntermediateDirectories:YES attributes:nil error:nil];
-		[payload writeToFile:candidate atomically:YES];
-	}
-}
-
 static NSString *PSStringFromSSIDData(NSData *data) {
 	if (![data isKindOfClass:NSData.class] || data.length == 0) {
 		return nil;
@@ -177,6 +178,12 @@ static BOOL PSProxyProfilesEqual(PSProxyProfile *lhs, PSProxyProfile *rhs) {
 	BOOL passwordEqual = (lhs.password.length == 0 && rhs.password.length == 0) || [lhs.password isEqualToString:rhs.password];
 	return [lhs.host isEqualToString:rhs.host] && lhs.port == rhs.port && usernameEqual && passwordEqual;
 }
+
+#ifndef PROXYSWITCHER_HELPER
+static BOOL PSIsHelperUnreachableError(NSError *error) {
+	return [error.domain isEqualToString:PSDiagnosticsErrorDomain] && error.code == PSHelperErrorUnreachable;
+}
+#endif
 
 #ifndef PROXYSWITCHER_HELPER
 static NSString *PSHelperPath(void) {
@@ -396,6 +403,7 @@ static BOOL PSWaitForWiFiSSID(NSString *ssid, NSTimeInterval timeout) {
 		_port = [coder decodeIntegerForKey:@"port"];
 		_username = [coder decodeObjectOfClass:NSString.class forKey:@"username"];
 		_password = [coder decodeObjectOfClass:NSString.class forKey:@"password"];
+		_noProxy = [coder decodeObjectOfClass:NSArray.class forKey:@"noProxy"];
 	}
 	return self;
 }
@@ -407,6 +415,7 @@ static BOOL PSWaitForWiFiSSID(NSString *ssid, NSTimeInterval timeout) {
 	[coder encodeInteger:self.port forKey:@"port"];
 	[coder encodeObject:self.username forKey:@"username"];
 	[coder encodeObject:self.password forKey:@"password"];
+	[coder encodeObject:self.noProxy forKey:@"noProxy"];
 }
 
 - (NSDictionary *)dictionaryRepresentation {
@@ -420,6 +429,9 @@ static BOOL PSWaitForWiFiSSID(NSString *ssid, NSTimeInterval timeout) {
 	}
 	if (self.password.length > 0) {
 		dictionary[@"password"] = self.password;
+	}
+	if (self.noProxy.count > 0) {
+		dictionary[@"noProxy"] = self.noProxy;
 	}
 	return dictionary;
 }
@@ -435,6 +447,20 @@ static BOOL PSWaitForWiFiSSID(NSString *ssid, NSTimeInterval timeout) {
 	profile.port = [dictionary[@"port"] respondsToSelector:@selector(integerValue)] ? [dictionary[@"port"] integerValue] : 8080;
 	profile.username = [dictionary[@"username"] isKindOfClass:NSString.class] ? dictionary[@"username"] : nil;
 	profile.password = [dictionary[@"password"] isKindOfClass:NSString.class] ? dictionary[@"password"] : nil;
+	NSArray *rawNoProxy = [dictionary[@"noProxy"] isKindOfClass:NSArray.class] ? dictionary[@"noProxy"] : nil;
+	if (rawNoProxy) {
+		NSMutableArray<NSString *> *normalized = [NSMutableArray array];
+		for (id value in rawNoProxy) {
+			if (![value isKindOfClass:NSString.class]) {
+				continue;
+			}
+			NSString *trimmed = [(NSString *)value stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+			if (trimmed.length > 0) {
+				[normalized addObject:trimmed];
+			}
+		}
+		profile.noProxy = normalized.copy;
+	}
 	if (profile.host.length == 0 || profile.port < 1 || profile.port > 65535) {
 		return nil;
 	}
@@ -462,18 +488,9 @@ static BOOL PSWaitForWiFiSSID(NSString *ssid, NSTimeInterval timeout) {
 	for (NSString *path in PSStorePathCandidates()) {
 		NSDictionary *dictionary = [NSDictionary dictionaryWithContentsOfFile:path];
 		if ([dictionary isKindOfClass:NSDictionary.class]) {
-			PSDebugWriteState(@{
-				@"phase": @"store-read",
-				@"path": path ?: @"",
-				@"profilesCount": @([[dictionary objectForKey:PSProfilesKey] isKindOfClass:NSArray.class] ? [(NSArray *)dictionary[PSProfilesKey] count] : 0),
-				@"quickWiFiCount": @([[dictionary objectForKey:PSQuickWiFiSSIDsKey] isKindOfClass:NSArray.class] ? [(NSArray *)dictionary[PSQuickWiFiSSIDsKey] count] : 0)
-			});
 			return dictionary;
 		}
 	}
-	PSDebugWriteState(@{
-		@"phase": @"store-read-empty"
-	});
 	return @{};
 }
 
@@ -566,7 +583,22 @@ static BOOL PSWaitForWiFiSSID(NSString *ssid, NSTimeInterval timeout) {
 
 - (PSProxyProfile *)temporaryProfile {
 	NSDictionary *dictionary = [self storeDictionary][PSTemporaryProfileKey];
-	return [dictionary isKindOfClass:NSDictionary.class] ? [PSProxyProfile profileWithDictionary:dictionary] : nil;
+	if (![dictionary isKindOfClass:NSDictionary.class]) {
+		return nil;
+	}
+	PSProxyProfile *profile = [PSProxyProfile profileWithDictionary:dictionary];
+	profile.name = @"Temporary";
+	return profile;
+}
+
+- (PSProxyProfile *)lastTemporaryProfile {
+	NSDictionary *dictionary = [self storeDictionary][PSLastTemporaryProfileKey];
+	if (![dictionary isKindOfClass:NSDictionary.class]) {
+		return nil;
+	}
+	PSProxyProfile *profile = [PSProxyProfile profileWithDictionary:dictionary];
+	profile.name = @"Temporary";
+	return profile;
 }
 
 - (void)setActiveIdentifier:(NSString *)identifier {
@@ -585,11 +617,23 @@ static BOOL PSWaitForWiFiSSID(NSString *ssid, NSTimeInterval timeout) {
 - (void)setTemporaryProfile:(PSProxyProfile *)profile {
 	NSMutableDictionary *store = [self storeDictionary].mutableCopy;
 	if (profile) {
+		profile.name = @"Temporary";
 		store[PSTemporaryProfileKey] = [profile dictionaryRepresentation];
+		store[PSLastTemporaryProfileKey] = [profile dictionaryRepresentation];
 		store[PSActiveIdentifierKey] = PSProxyTemporaryIdentifier;
 		[store removeObjectForKey:@"ActiveIdentifier"];
 	} else {
 		[store removeObjectForKey:PSTemporaryProfileKey];
+	}
+	[self writeStoreDictionary:store];
+}
+
+- (void)clearTemporaryProfile {
+	NSMutableDictionary *store = [self storeDictionary].mutableCopy;
+	[store removeObjectForKey:PSTemporaryProfileKey];
+	[store removeObjectForKey:PSLastTemporaryProfileKey];
+	if ([[store objectForKey:PSActiveIdentifierKey] isEqualToString:PSProxyTemporaryIdentifier]) {
+		store[PSActiveIdentifierKey] = PSProxyDirectIdentifier;
 	}
 	[self writeStoreDictionary:store];
 }
@@ -648,7 +692,8 @@ static BOOL PSWaitForWiFiSSID(NSString *ssid, NSTimeInterval timeout) {
 		@"ProxyServerPort",
 		@"ProxyUsername",
 		@"ProxyPassword",
-		@"ProxyPACURL"
+		@"ProxyPACURL",
+		@"ExceptionsList"
 	]];
 	if (profile) {
 		network[@"ProxyType"] = @"Manual";
@@ -659,6 +704,9 @@ static BOOL PSWaitForWiFiSSID(NSString *ssid, NSTimeInterval timeout) {
 		}
 		if (profile.password.length > 0) {
 			network[@"ProxyPassword"] = profile.password;
+		}
+		if (profile.noProxy.count > 0) {
+			network[@"ExceptionsList"] = profile.noProxy;
 		}
 	}
 	knownNetworks[networkKey] = network;
@@ -889,7 +937,7 @@ static BOOL PSWaitForWiFiSSID(NSString *ssid, NSTimeInterval timeout) {
 		if ([configuration[@"HTTPEnable"] boolValue] && [configuration[@"HTTPProxy"] isKindOfClass:NSString.class] && [configuration[@"HTTPPort"] respondsToSelector:@selector(integerValue)]) {
 			PSProxyProfile *temporary = [[PSProxyProfile alloc] init];
 			temporary.identifier = PSProxyTemporaryIdentifier;
-			temporary.name = [self currentWiFiSSID] ?: @"Current Wi-Fi";
+			temporary.name = @"Temporary";
 			temporary.host = configuration[@"HTTPProxy"];
 			temporary.port = [configuration[@"HTTPPort"] integerValue];
 			profile = temporary;
@@ -915,7 +963,7 @@ static BOOL PSWaitForWiFiSSID(NSString *ssid, NSTimeInterval timeout) {
 		}
 		if ([targetIdentifier isEqualToString:PSProxyDirectIdentifier]) {
 			temporaryProfile = systemProfile;
-			temporaryProfile.name = [NSString stringWithFormat:@"%@:%ld", systemProfile.host, (long)systemProfile.port];
+			temporaryProfile.name = @"Temporary";
 			targetIdentifier = PSProxyTemporaryIdentifier;
 		}
 	}
@@ -935,11 +983,22 @@ static BOOL PSWaitForWiFiSSID(NSString *ssid, NSTimeInterval timeout) {
 
 - (BOOL)applyDirectWithError:(NSError **)error {
 #ifndef PROXYSWITCHER_HELPER
-	BOOL ok = [self runHelperWithArguments:@[@"direct"] error:error];
+	NSError *helperError = nil;
+	BOOL ok = [self runHelperWithArguments:@[@"direct"] error:&helperError];
 	if (ok) {
 		[self setActiveIdentifier:PSProxyDirectIdentifier];
+		return YES;
 	}
-	return ok;
+	if (PSIsHelperUnreachableError(helperError)) {
+		[self syncActiveProfileWithCurrentSystemProxy:nil];
+		if ([self currentSystemProxyProfile] == nil) {
+			return YES;
+		}
+	}
+	if (error) {
+		*error = helperError;
+	}
+	return NO;
 #else
 	BOOL ok = [self applyProxyConfiguration:nil error:error];
 	if (ok) {
@@ -959,16 +1018,64 @@ static BOOL PSWaitForWiFiSSID(NSString *ssid, NSTimeInterval timeout) {
 		return NO;
 	}
 #ifndef PROXYSWITCHER_HELPER
-	BOOL ok = [self runHelperWithArguments:@[@"apply", identifier] error:error];
+	NSError *helperError = nil;
+	BOOL ok = [self runHelperWithArguments:@[@"apply", identifier] error:&helperError];
 	if (ok) {
 		[self setActiveIdentifier:identifier];
+		return YES;
 	}
-	return ok;
+	if (PSIsHelperUnreachableError(helperError)) {
+		[self syncActiveProfileWithCurrentSystemProxy:nil];
+		PSProxyProfile *currentProfile = [self currentSystemProxyProfile];
+		if (currentProfile && PSProxyProfilesEqual(currentProfile, profile)) {
+			return YES;
+		}
+	}
+	if (error) {
+		*error = helperError;
+	}
+	return NO;
 #else
 	BOOL ok = [self applyProxyConfiguration:profile error:error];
 	if (ok) {
 		[self setWiFiServiceIdentifier:[self currentWiFiServiceIdentifier] forSSID:[self currentWiFiSSID]];
 		[self setActiveIdentifier:identifier];
+	}
+	return ok;
+#endif
+}
+
+- (BOOL)applyTemporaryProfileWithError:(NSError **)error {
+	PSProxyProfile *temporary = [self temporaryProfile] ?: [self lastTemporaryProfile];
+	if (!temporary) {
+		if (error) {
+			*error = [NSError errorWithDomain:@"ProxySwitcher" code:405 userInfo:@{NSLocalizedDescriptionKey: @"Temporary proxy profile not found."}];
+		}
+		return NO;
+	}
+#ifndef PROXYSWITCHER_HELPER
+	NSError *helperError = nil;
+	BOOL ok = [self runHelperWithArguments:@[@"apply-temp"] error:&helperError];
+	if (ok) {
+		[self setTemporaryProfile:temporary];
+		return YES;
+	}
+	if (PSIsHelperUnreachableError(helperError)) {
+		[self syncActiveProfileWithCurrentSystemProxy:nil];
+		PSProxyProfile *currentProfile = [self currentSystemProxyProfile];
+		if (currentProfile && PSProxyProfilesEqual(currentProfile, temporary)) {
+			return YES;
+		}
+	}
+	if (error) {
+		*error = helperError;
+	}
+	return NO;
+#else
+	BOOL ok = [self applyProxyConfiguration:temporary error:error];
+	if (ok) {
+		[self setWiFiServiceIdentifier:[self currentWiFiServiceIdentifier] forSSID:[self currentWiFiSSID]];
+		[self setTemporaryProfile:temporary];
 	}
 	return ok;
 #endif
@@ -982,7 +1089,25 @@ static BOOL PSWaitForWiFiSSID(NSString *ssid, NSTimeInterval timeout) {
 		return NO;
 	}
 #ifndef PROXYSWITCHER_HELPER
-	return [self runHelperWithArguments:@[@"wifi", ssid] timeout:PSProxyHelperWiFiTimeout response:nil error:error];
+	NSError *helperError = nil;
+	BOOL ok = [self runHelperWithArguments:@[@"wifi", ssid] timeout:PSProxyHelperWiFiTimeout response:nil error:&helperError];
+	if (ok) {
+		[self setWiFiServiceIdentifier:[self currentWiFiServiceIdentifier] forSSID:[self currentWiFiSSID]];
+		[self syncActiveProfileWithCurrentSystemProxy:nil];
+		return YES;
+	}
+	if (PSIsHelperUnreachableError(helperError)) {
+		NSString *currentSSID = [self currentWiFiSSID];
+		if ([currentSSID isEqualToString:ssid]) {
+			[self setWiFiServiceIdentifier:[self currentWiFiServiceIdentifier] forSSID:currentSSID];
+			[self syncActiveProfileWithCurrentSystemProxy:nil];
+			return YES;
+		}
+	}
+	if (error) {
+		*error = helperError;
+	}
+	return NO;
 #else
 	typedef CFTypeRef (*WiFiManagerClientCreateFn)(CFAllocatorRef allocator, int flags);
 	typedef CFArrayRef (*WiFiManagerClientCopyDevicesFn)(CFTypeRef manager);
@@ -1084,7 +1209,10 @@ static BOOL PSWaitForWiFiSSID(NSString *ssid, NSTimeInterval timeout) {
 	NSString *helperPath = PSHelperPath();
 	if (![[NSFileManager defaultManager] fileExistsAtPath:helperPath]) {
 		if (error) {
-			*error = [NSError errorWithDomain:@"ProxySwitcher" code:10 userInfo:@{NSLocalizedDescriptionKey: @"ProxySwitcher helper is not installed."}];
+			*error = [NSError errorWithDomain:PSDiagnosticsErrorDomain code:PSHelperErrorNotInstalled userInfo:@{
+				NSLocalizedDescriptionKey: @"ProxySwitcher helper is not installed.",
+				@"reason": @"helper_missing"
+			}];
 		}
 		return NO;
 	}
@@ -1092,7 +1220,10 @@ static BOOL PSWaitForWiFiSSID(NSString *ssid, NSTimeInterval timeout) {
 	int socketFD = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (socketFD < 0) {
 		if (error) {
-			*error = [NSError errorWithDomain:@"ProxySwitcher" code:12 userInfo:@{NSLocalizedDescriptionKey: @"Unable to open helper socket."}];
+			*error = [NSError errorWithDomain:PSDiagnosticsErrorDomain code:PSHelperErrorRequestWriteFailed userInfo:@{
+				NSLocalizedDescriptionKey: @"Unable to open helper socket.",
+				@"reason": @"socket_open_failed"
+			}];
 		}
 		return NO;
 	}
@@ -1120,12 +1251,16 @@ static BOOL PSWaitForWiFiSSID(NSString *ssid, NSTimeInterval timeout) {
 	if (!connected) {
 		close(socketFD);
 		if (error) {
-			*error = [NSError errorWithDomain:@"ProxySwitcher" code:13 userInfo:@{NSLocalizedDescriptionKey: @"ProxySwitcher helper did not respond."}];
+			*error = [NSError errorWithDomain:PSDiagnosticsErrorDomain code:PSHelperErrorUnreachable userInfo:@{
+				NSLocalizedDescriptionKey: @"ProxySwitcher helper did not respond.",
+				@"reason": @"socket_connect_failed"
+			}];
 		}
 		return NO;
 	}
 
 	NSDictionary *request = @{
+		@"version": PSProtocolVersion,
 		@"command": arguments.firstObject ?: @"",
 		@"argument": arguments.count > 1 ? arguments[1] : @""
 	};
@@ -1133,7 +1268,10 @@ static BOOL PSWaitForWiFiSSID(NSString *ssid, NSTimeInterval timeout) {
 	if (!requestData) {
 		close(socketFD);
 		if (error) {
-			*error = [NSError errorWithDomain:@"ProxySwitcher" code:12 userInfo:@{NSLocalizedDescriptionKey: @"Unable to encode helper request."}];
+			*error = [NSError errorWithDomain:PSDiagnosticsErrorDomain code:PSHelperErrorRequestWriteFailed userInfo:@{
+				NSLocalizedDescriptionKey: @"Unable to encode helper request.",
+				@"reason": @"request_encode_failed"
+			}];
 		}
 		return NO;
 	}
@@ -1146,7 +1284,10 @@ static BOOL PSWaitForWiFiSSID(NSString *ssid, NSTimeInterval timeout) {
 		if (written <= 0) {
 			close(socketFD);
 			if (error) {
-				*error = [NSError errorWithDomain:@"ProxySwitcher" code:12 userInfo:@{NSLocalizedDescriptionKey: @"Unable to write helper request."}];
+				*error = [NSError errorWithDomain:PSDiagnosticsErrorDomain code:PSHelperErrorRequestWriteFailed userInfo:@{
+					NSLocalizedDescriptionKey: @"Unable to write helper request.",
+					@"reason": @"request_write_failed"
+				}];
 			}
 			return NO;
 		}
@@ -1163,7 +1304,10 @@ static BOOL PSWaitForWiFiSSID(NSString *ssid, NSTimeInterval timeout) {
 		if (count < 0) {
 			close(socketFD);
 			if (error) {
-				*error = [NSError errorWithDomain:@"ProxySwitcher" code:13 userInfo:@{NSLocalizedDescriptionKey: @"ProxySwitcher helper did not respond."}];
+				*error = [NSError errorWithDomain:PSDiagnosticsErrorDomain code:PSHelperErrorUnreachable userInfo:@{
+					NSLocalizedDescriptionKey: @"ProxySwitcher helper did not respond.",
+					@"reason": @"response_read_failed"
+				}];
 			}
 			return NO;
 		}
@@ -1187,7 +1331,10 @@ static BOOL PSWaitForWiFiSSID(NSString *ssid, NSTimeInterval timeout) {
 
 	if (responseData.length == 0) {
 		if (error) {
-			*error = [NSError errorWithDomain:@"ProxySwitcher" code:13 userInfo:@{NSLocalizedDescriptionKey: @"ProxySwitcher helper did not respond."}];
+			*error = [NSError errorWithDomain:PSDiagnosticsErrorDomain code:PSHelperErrorUnreachable userInfo:@{
+				NSLocalizedDescriptionKey: @"ProxySwitcher helper did not respond.",
+				@"reason": @"response_empty"
+			}];
 		}
 		return NO;
 	}
@@ -1195,7 +1342,19 @@ static BOOL PSWaitForWiFiSSID(NSString *ssid, NSTimeInterval timeout) {
 	NSDictionary *response = [NSJSONSerialization JSONObjectWithData:responseData options:0 error:nil];
 	if (![response isKindOfClass:NSDictionary.class]) {
 		if (error) {
-			*error = [NSError errorWithDomain:@"ProxySwitcher" code:15 userInfo:@{NSLocalizedDescriptionKey: @"ProxySwitcher helper returned an invalid response."}];
+			*error = [NSError errorWithDomain:PSDiagnosticsErrorDomain code:PSHelperErrorInvalidResponse userInfo:@{
+				NSLocalizedDescriptionKey: @"ProxySwitcher helper returned an invalid response.",
+				@"reason": @"response_invalid_json"
+			}];
+		}
+		return NO;
+	}
+	if (![response[@"version"] isKindOfClass:NSString.class] || ![response[@"version"] isEqualToString:PSProtocolVersion]) {
+		if (error) {
+			*error = [NSError errorWithDomain:PSDiagnosticsErrorDomain code:PSHelperErrorInvalidResponse userInfo:@{
+				NSLocalizedDescriptionKey: @"ProxySwitcher helper protocol version mismatch.",
+				@"reason": @"protocol_mismatch"
+			}];
 		}
 		return NO;
 	}
@@ -1205,20 +1364,15 @@ static BOOL PSWaitForWiFiSSID(NSString *ssid, NSTimeInterval timeout) {
 		if (responseMessage) {
 			*responseMessage = message ?: @"";
 		}
-		PSDebugWriteState(@{
-			@"phase": @"helper-ok",
-			@"command": arguments.firstObject ?: @"",
-			@"argument": arguments.count > 1 ? arguments[1] : @""
-		});
 		return YES;
 	}
-	PSDebugWriteState(@{
-		@"phase": @"helper-failed",
-		@"command": arguments.firstObject ?: @"",
-		@"message": message ?: @""
-	});
+	NSNumber *codeNumber = [response[@"code"] respondsToSelector:@selector(integerValue)] ? response[@"code"] : @(PSHelperErrorOperationFailed);
+	NSString *reason = [response[@"reason"] isKindOfClass:NSString.class] ? response[@"reason"] : @"operation_failed";
 	if (error) {
-		*error = [NSError errorWithDomain:@"ProxySwitcher" code:11 userInfo:@{NSLocalizedDescriptionKey: message.length > 0 ? message : @"ProxySwitcher helper could not update proxy settings."}];
+		*error = [NSError errorWithDomain:PSDiagnosticsErrorDomain code:codeNumber.integerValue userInfo:@{
+			NSLocalizedDescriptionKey: message.length > 0 ? message : @"ProxySwitcher helper could not update proxy settings.",
+			@"reason": reason
+		}];
 	}
 	return NO;
 }
@@ -1296,6 +1450,19 @@ static BOOL PSWaitForWiFiSSID(NSString *ssid, NSTimeInterval timeout) {
 	return nil;
 }
 
+- (NSDictionary<NSString *, id> *)diagnosticsSnapshot {
+	NSDictionary *store = [self storeDictionary];
+	NSArray *profiles = [store[PSProfilesKey] isKindOfClass:NSArray.class] ? store[PSProfilesKey] : @[];
+	NSArray *quickWiFi = [store[PSQuickWiFiSSIDsKey] isKindOfClass:NSArray.class] ? store[PSQuickWiFiSSIDsKey] : @[];
+	return @{
+		@"activeIdentifier": [self activeIdentifier] ?: PSProxyDirectIdentifier,
+		@"currentSSID": [self currentWiFiSSID] ?: @"",
+		@"profilesCount": @(profiles.count),
+		@"quickWiFiCount": @(quickWiFi.count),
+		@"helperSocketPath": PSProxyHelperSocketPath ?: @""
+	};
+}
+
 - (BOOL)applyProxyConfiguration:(PSProxyProfile *)profile error:(NSError **)error {
 	NSString *serviceIdentifier = [self currentWiFiServiceIdentifier];
 	if (serviceIdentifier.length == 0) {
@@ -1367,7 +1534,8 @@ static BOOL PSWaitForWiFiSSID(NSString *ssid, NSTimeInterval timeout) {
 			@"HTTPSPort",
 			@"ProxyAutoConfigEnable",
 			@"ProxyAutoConfigURLString",
-			@"ProxyAutoDiscoveryEnable"
+			@"ProxyAutoDiscoveryEnable",
+			@"ExceptionsList"
 		]];
 
 		if (profile) {
@@ -1377,6 +1545,9 @@ static BOOL PSWaitForWiFiSSID(NSString *ssid, NSTimeInterval timeout) {
 			configuration[@"HTTPSEnable"] = @1;
 			configuration[@"HTTPSProxy"] = profile.host;
 			configuration[@"HTTPSPort"] = @(profile.port);
+			if (profile.noProxy.count > 0) {
+				configuration[@"ExceptionsList"] = profile.noProxy;
+			}
 		}
 
 		if (protocolSetConfiguration(protocol, (__bridge CFDictionaryRef)configuration) &&

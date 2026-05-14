@@ -32,6 +32,10 @@ Install after building:
 make install-roothide
 ```
 
+Implementation rules and engineering conventions:
+
+- [Implementation Guidelines](docs/implementation-guidelines.md)
+
 ## Usage
 
 Open ProxySwitcher, add one or more proxy profiles, then tap Direct or a profile to apply it to the current Wi-Fi. Add the ProxySwitcher module in Settings > Control Center. Tapping the module cycles through Direct and the saved profiles; turning it off applies Direct.

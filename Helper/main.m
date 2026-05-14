@@ -9,20 +9,15 @@
 #import <sys/un.h>
 #import <unistd.h>
 
-static void WriteHelperStatus(NSString *message) {
-	NSString *path = @"/private/var/mobile/Library/Preferences/codes.var.tweak.proxyswitcher.helper.log";
-	NSString *line = [NSString stringWithFormat:@"%@\n", message ?: @""];
-	[line writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
-	chown(path.fileSystemRepresentation, 501, 501);
-	chmod(path.fileSystemRepresentation, 0644);
-}
-
 static BOOL RunCommand(NSString *command, NSString *profileIdentifier, NSError **error) {
 	if ([command isEqualToString:@"direct"]) {
 		return [[PSProxyManager sharedManager] applyDirectWithError:error];
 	}
 	if ([command isEqualToString:@"apply"] && profileIdentifier.length > 0) {
 		return [[PSProxyManager sharedManager] applyProfileWithIdentifier:profileIdentifier error:error];
+	}
+	if ([command isEqualToString:@"apply-temp"]) {
+		return [[PSProxyManager sharedManager] applyTemporaryProfileWithError:error];
 	}
 	if ([command isEqualToString:@"wifi"] && profileIdentifier.length > 0) {
 		return [[PSProxyManager sharedManager] switchToWiFiSSID:profileIdentifier error:error];
@@ -55,17 +50,28 @@ static NSDictionary *RunRequest(NSDictionary *request) {
 	@autoreleasepool {
 		NSString *command = [request[@"command"] isKindOfClass:NSString.class] ? request[@"command"] : @"";
 		NSString *profileIdentifier = [request[@"argument"] isKindOfClass:NSString.class] ? request[@"argument"] : @"";
+		NSString *version = [request[@"version"] isKindOfClass:NSString.class] ? request[@"version"] : @"";
+		if (![version isEqualToString:@"1"]) {
+			return @{@"version": @"1", @"ok": @NO, @"code": @15, @"reason": @"protocol_mismatch", @"message": @"Unsupported helper protocol version."};
+		}
 		NSError *error = nil;
 		BOOL ok = NO;
 		NSString *message = @"";
+		NSInteger code = ok ? 0 : 11;
+		NSString *reason = ok ? @"ok" : @"operation_failed";
 		if ([command isEqualToString:@"listwifi"]) {
 			ok = YES;
 			message = JSONStringForAvailableWiFiNetworks();
+			code = 0;
+			reason = @"ok";
 		} else {
 			ok = RunCommand(command, profileIdentifier, &error);
 			message = ok ? @"" : (error.localizedDescription ?: @"Unable to update proxy settings.");
+			code = ok ? 0 : error.code;
+			NSString *errorReason = [error.userInfo[@"reason"] isKindOfClass:NSString.class] ? error.userInfo[@"reason"] : nil;
+			reason = ok ? @"ok" : (errorReason.length > 0 ? errorReason : @"operation_failed");
 		}
-		return @{@"ok": @(ok), @"message": message ?: @""};
+		return @{@"version": @"1", @"ok": @(ok), @"code": @(code), @"reason": reason, @"message": message ?: @""};
 	}
 }
 
@@ -120,7 +126,6 @@ static BOOL StartSocketServer(void) {
 	static dispatch_queue_t operationQueue;
 	int serverFD = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (serverFD < 0) {
-		WriteHelperStatus([NSString stringWithFormat:@"socket failed errno=%d", errno]);
 		return NO;
 	}
 
@@ -128,21 +133,18 @@ static BOOL StartSocketServer(void) {
 	memset(&address, 0, sizeof(address));
 	address.sun_family = AF_UNIX;
 	if (PSProxyHelperSocketPath.length >= sizeof(address.sun_path)) {
-		WriteHelperStatus(@"socket path too long");
 		close(serverFD);
 		return NO;
 	}
 	strlcpy(address.sun_path, PSProxyHelperSocketPath.fileSystemRepresentation, sizeof(address.sun_path));
 	unlink(address.sun_path);
 	if (bind(serverFD, (struct sockaddr *)&address, sizeof(address)) != 0) {
-		WriteHelperStatus([NSString stringWithFormat:@"bind failed errno=%d path=%@", errno, PSProxyHelperSocketPath]);
 		close(serverFD);
 		return NO;
 	}
 	chown(address.sun_path, 501, 501);
 	chmod(address.sun_path, 0666);
 	if (listen(serverFD, 8) != 0) {
-		WriteHelperStatus([NSString stringWithFormat:@"listen failed errno=%d path=%@", errno, PSProxyHelperSocketPath]);
 		close(serverFD);
 		unlink(address.sun_path);
 		return NO;
@@ -173,7 +175,6 @@ static BOOL StartSocketServer(void) {
 		unlink(address.sun_path);
 	});
 	dispatch_resume(acceptSource);
-	WriteHelperStatus([NSString stringWithFormat:@"listening path=%@", PSProxyHelperSocketPath]);
 	return YES;
 }
 
