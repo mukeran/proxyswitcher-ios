@@ -14,6 +14,9 @@ static UIImage *transparentImage() {
     int _notifyToken;
     NSMutableIndexSet *_sectionActionIndexes;
     NSUInteger _openAppActionIndex;
+    NSUInteger _statusActionIndex;
+    BOOL _operationInProgress;
+    NSString *_operationTitle;
 }
 
 - (void)willTransitionToExpandedContentMode:(BOOL)expanded {
@@ -78,38 +81,64 @@ static UIImage *transparentImage() {
 }
 
 - (void)applyDirect {
+    if (_operationInProgress) {
+        return;
+    }
+    [self beginOperationWithTitle:@"Applying Direct..."];
     __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         NSError *error;
         [[PSProxyManager sharedManager] applyDirectWithError:&error];
         dispatch_async(dispatch_get_main_queue(), ^{
-            [weakSelf refreshState];
+            [weakSelf finishOperation];
         });
     });
 }
 
 - (void)applyProfile:(PSProxyProfile *)profile {
+    if (_operationInProgress) {
+        return;
+    }
     NSString *identifier = profile.identifier;
+    [self beginOperationWithTitle:[NSString stringWithFormat:@"Applying %@...", profile.name]];
     __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         NSError *error;
         [[PSProxyManager sharedManager] applyProfileWithIdentifier:identifier error:&error];
         dispatch_async(dispatch_get_main_queue(), ^{
-            [weakSelf refreshState];
+            [weakSelf finishOperation];
         });
     });
 }
 
 - (void)switchToWiFiNetwork:(PSWiFiNetwork *)network {
+    if (_operationInProgress) {
+        return;
+    }
     NSString *ssid = network.ssid;
+    [self beginOperationWithTitle:[NSString stringWithFormat:@"Switching to %@...", network.displayName]];
     __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         NSError *error;
         [[PSProxyManager sharedManager] switchToWiFiSSID:ssid error:&error];
         dispatch_async(dispatch_get_main_queue(), ^{
-            [weakSelf refreshState];
+            [weakSelf finishOperation];
         });
     });
+}
+
+- (void)beginOperationWithTitle:(NSString *)title {
+    _operationInProgress = YES;
+    _operationTitle = [title copy];
+    [self refreshActions];
+    [self refreshState];
+}
+
+- (void)finishOperation {
+    _operationInProgress = NO;
+    _operationTitle = nil;
+    [self refreshActions];
+    [self refreshState];
 }
 
 - (void)openApp {
@@ -168,11 +197,28 @@ static UIImage *transparentImage() {
         if ([_sectionActionIndexes containsIndex:index]) {
             itemView.userInteractionEnabled = NO;
             itemView.separatorVisible = index > 0;
-            titleLabel.font = [UIFont systemFontOfSize:11.0 weight:UIFontWeightSemibold];
-            titleLabel.textColor = UIColor.secondaryLabelColor ?: [UIColor colorWithWhite:1.0 alpha:0.58];
+            titleLabel.font = [UIFont systemFontOfSize:13.0 weight:UIFontWeightHeavy];
+            if (@available(iOS 13.0, *)) {
+                titleLabel.textColor = UIColor.systemTealColor;
+            } else {
+                titleLabel.textColor = [UIColor colorWithRed:0.0 green:0.75 blue:0.7 alpha:1.0];
+            }
             subtitleLabel.hidden = YES;
             glyphImageView.hidden = YES;
             highlightedBackgroundView.hidden = YES;
+            return;
+        }
+
+        if (index == _statusActionIndex) {
+            itemView.userInteractionEnabled = NO;
+            itemView.separatorVisible = NO;
+            titleLabel.font = [UIFont systemFontOfSize:titleLabel.font.pointSize weight:UIFontWeightSemibold];
+            subtitleLabel.hidden = NO;
+            highlightedBackgroundView.hidden = YES;
+            if (@available(iOS 13.0, *)) {
+                titleLabel.textColor = UIColor.systemOrangeColor;
+                glyphImageView.tintColor = UIColor.systemOrangeColor;
+            }
             return;
         }
 
@@ -191,6 +237,7 @@ static UIImage *transparentImage() {
     [self removeAllActions];
     _sectionActionIndexes = [NSMutableIndexSet indexSet];
     _openAppActionIndex = NSNotFound;
+    _statusActionIndex = NSNotFound;
     
     NSArray<PSProxyProfile *> *profiles = [[PSProxyManager sharedManager] profiles];
     NSArray<PSWiFiNetwork *> *wifiNetworks = [[PSProxyManager sharedManager] quickWiFiNetworks];
@@ -199,8 +246,16 @@ static UIImage *transparentImage() {
     NSString *currentSSID = [[PSProxyManager sharedManager] currentWiFiSSID];
     
     __weak typeof(self) weakSelf = self;
+
+    if (_operationInProgress) {
+        UIImage *statusGlyph = transparentImage();
+        if (@available(iOS 13.0, *)) {
+            statusGlyph = [UIImage systemImageNamed:@"hourglass"];
+        }
+        _statusActionIndex = [self addMenuActionWithTitle:@"Working..." subtitle:_operationTitle ?: @"Updating proxy settings..." glyph:statusGlyph handler:^{}];
+    }
     
-    [self addSectionTitle:@"PROXY"];
+    [self addSectionTitle:@"🌐  PROXY"];
 
     UIImage *directGlyph = transparentImage();
     if (@available(iOS 13.0, *)) {
@@ -222,7 +277,7 @@ static UIImage *transparentImage() {
     }
 
     if (wifiNetworks.count > 0) {
-        [self addSectionTitle:@"WI-FI"];
+        [self addSectionTitle:@"📶  WI-FI"];
         for (PSWiFiNetwork *network in wifiNetworks) {
             UIImage *glyph = transparentImage();
             if (@available(iOS 13.0, *)) {
@@ -246,6 +301,9 @@ static UIImage *transparentImage() {
 }
 
 - (void)buttonTapped:(id)arg1 forEvent:(id)arg2 {
+    if (_operationInProgress) {
+        return;
+    }
     BOOL selected = !self.selected;
     NSString *targetIdentifier = nil;
     if (selected) {
@@ -261,6 +319,7 @@ static UIImage *transparentImage() {
         }
     }
     __weak typeof(self) weakSelf = self;
+    [self beginOperationWithTitle:targetIdentifier ? @"Applying proxy..." : @"Applying Direct..."];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         NSError *error;
         if (targetIdentifier) {
@@ -269,7 +328,7 @@ static UIImage *transparentImage() {
             [[PSProxyManager sharedManager] applyDirectWithError:&error];
         }
         dispatch_async(dispatch_get_main_queue(), ^{
-            [weakSelf refreshState];
+            [weakSelf finishOperation];
         });
     });
     [super buttonTapped:arg1 forEvent:arg2];

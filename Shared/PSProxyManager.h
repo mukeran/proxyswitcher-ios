@@ -5,7 +5,7 @@ NS_ASSUME_NONNULL_BEGIN
 extern NSString * const PSProxyDirectIdentifier;
 extern NSString * const PSProxyTemporaryIdentifier;
 extern NSString * const PSProxyProfilesChangedNotification;
-extern NSString * const PSProxyRequestNotification;
+extern NSString * const PSProxyHelperSocketPath;
 
 @interface PSProxyProfile : NSObject <NSSecureCoding>
 

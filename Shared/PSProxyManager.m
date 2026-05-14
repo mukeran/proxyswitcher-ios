@@ -7,18 +7,27 @@
 #import <errno.h>
 #import <objc/message.h>
 #import <string.h>
+#import <sys/socket.h>
+#import <sys/un.h>
+#import <unistd.h>
 #import <sys/wait.h>
 
 NSString * const PSProxyDirectIdentifier = @"direct";
 NSString * const PSProxyTemporaryIdentifier = @"temporary";
 NSString * const PSProxyProfilesChangedNotification = @"codes.var.tweak.proxyswitcher.profiles.changed";
-NSString * const PSProxyRequestNotification = @"codes.var.tweak.proxyswitcher.request";
+NSString * const PSProxyHelperSocketPath = @"/private/var/mobile/Library/Preferences/codes.var.tweak.proxyswitcher.sock";
 
 static NSString * const PSProfilesKey = @"profiles";
 static NSString * const PSActiveIdentifierKey = @"activeIdentifier";
 static NSString * const PSTemporaryProfileKey = @"temporaryProfile";
 static NSString * const PSQuickWiFiSSIDsKey = @"quickWiFiSSIDs";
 static NSString * const PSWiFiServiceIdentifiersKey = @"wifiServiceIdentifiers";
+
+#ifndef PROXYSWITCHER_HELPER
+static const NSTimeInterval PSProxyHelperDefaultTimeout = 20.0;
+static const NSTimeInterval PSProxyHelperWiFiTimeout = 60.0;
+static const NSUInteger PSProxyHelperMaxResponseLength = 1024 * 1024;
+#endif
 
 static NSString *PSRootfsPath(NSString *path) {
 	if ([[NSFileManager defaultManager] fileExistsAtPath:[@"/rootfs" stringByAppendingString:path]]) {
@@ -35,17 +44,43 @@ static NSString *PSLegacyStorePath(void) {
 	return @"/private/var/mobile/Library/Preferences/com.example.proxyswitcher.plist";
 }
 
+static NSArray<NSString *> *PSPathCandidates(NSString *path) {
+	NSString *rootfsPath = [@"/rootfs" stringByAppendingString:path];
+	return @[rootfsPath, path];
+}
+
+static NSArray<NSString *> *PSStorePathCandidates(void) {
+	return PSPathCandidates(PSStorePath());
+}
+
+static NSArray<NSString *> *PSLegacyStorePathCandidates(void) {
+	return PSPathCandidates(PSLegacyStorePath());
+}
+
 static void PSMigrateLegacyStoreIfNeeded(void) {
 	NSFileManager *fileManager = [NSFileManager defaultManager];
-	NSString *storePath = PSStorePath();
-	if ([fileManager fileExistsAtPath:storePath]) {
+	for (NSString *storePath in PSStorePathCandidates()) {
+		if ([fileManager fileExistsAtPath:storePath]) {
+			return;
+		}
+	}
+	NSString *legacyPath = nil;
+	for (NSString *candidate in PSLegacyStorePathCandidates()) {
+		if ([fileManager fileExistsAtPath:candidate]) {
+			legacyPath = candidate;
+			break;
+		}
+	}
+	if (legacyPath.length == 0) {
 		return;
 	}
-	NSString *legacyPath = PSLegacyStorePath();
-	if (![fileManager fileExistsAtPath:legacyPath]) {
-		return;
+	for (NSString *storePath in PSStorePathCandidates()) {
+		NSString *directory = [storePath stringByDeletingLastPathComponent];
+		[fileManager createDirectoryAtPath:directory withIntermediateDirectories:YES attributes:nil error:nil];
+		if ([fileManager copyItemAtPath:legacyPath toPath:storePath error:nil]) {
+			return;
+		}
 	}
-	[fileManager copyItemAtPath:legacyPath toPath:storePath error:nil];
 }
 
 static NSString *PSKnownNetworksPath(void) {
@@ -63,6 +98,17 @@ static id PSPropertyListAtPath(NSString *path, NSPropertyListMutabilityOptions o
 static BOOL PSWritePropertyList(id plist, NSString *path) {
 	NSData *data = [NSPropertyListSerialization dataWithPropertyList:plist format:NSPropertyListBinaryFormat_v1_0 options:0 error:nil];
 	return data ? [data writeToFile:path atomically:YES] : NO;
+}
+
+static void PSDebugWriteState(NSDictionary *state) {
+	NSString *path = @"/private/var/mobile/Library/Preferences/codes.var.tweak.proxyswitcher.debug.plist";
+	NSMutableDictionary *payload = [state isKindOfClass:NSDictionary.class] ? [state mutableCopy] : [NSMutableDictionary dictionary];
+	payload[@"timestamp"] = @([[NSDate date] timeIntervalSince1970]);
+	for (NSString *candidate in PSPathCandidates(path)) {
+		NSString *directory = [candidate stringByDeletingLastPathComponent];
+		[[NSFileManager defaultManager] createDirectoryAtPath:directory withIntermediateDirectories:YES attributes:nil error:nil];
+		[payload writeToFile:candidate atomically:YES];
+	}
 }
 
 static NSString *PSStringFromSSIDData(NSData *data) {
@@ -133,24 +179,20 @@ static BOOL PSProxyProfilesEqual(PSProxyProfile *lhs, PSProxyProfile *rhs) {
 }
 
 #ifndef PROXYSWITCHER_HELPER
-static NSString *PSJailbreakPath(NSString *path) {
+static NSString *PSHelperPath(void) {
 #ifdef THEOS_PACKAGE_SCHEME_ROOTHIDE
-	return jbroot(path);
+	return jbroot(@"/usr/bin/proxyswitcherctl");
 #else
-	return path;
+	return @"/usr/bin/proxyswitcherctl";
 #endif
 }
 
-static NSString *PSRequestPath(void) {
-	return PSJailbreakPath(@"/var/mobile/Library/Preferences/codes.var.tweak.proxyswitcher.request");
+static NSString *PSHelperSocketPath(void) {
+	return PSProxyHelperSocketPath;
 }
 
-static NSString *PSResponsePath(void) {
-	return PSJailbreakPath(@"/var/mobile/Library/Preferences/codes.var.tweak.proxyswitcher.response");
-}
-
-static NSString *PSHelperPath(void) {
-	return PSJailbreakPath(@"/usr/bin/proxyswitcherctl");
+static NSArray<NSString *> *PSHelperSocketPathCandidates(void) {
+	return PSPathCandidates(PSHelperSocketPath());
 }
 #endif
 
@@ -258,6 +300,76 @@ static BOOL PSSwitchToWiFiSSIDUsingCoreWiFi(NSString *ssid, NSError **error) {
 }
 #endif
 
+#ifdef PROXYSWITCHER_HELPER
+static void PSWiFiWaitCallback(SCDynamicStoreRef store, CFArrayRef changedKeys, void *info) {
+	NSMutableDictionary *state = (__bridge NSMutableDictionary *)info;
+	NSString *targetSSID = state[@"targetSSID"];
+	if (targetSSID.length == 0) {
+		return;
+	}
+	if ([[[PSProxyManager sharedManager] currentWiFiSSID] isEqualToString:targetSSID]) {
+		state[@"matched"] = @YES;
+		NSValue *runLoopValue = state[@"runLoop"];
+		CFRunLoopRef runLoop = runLoopValue ? (CFRunLoopRef)runLoopValue.pointerValue : NULL;
+		if (runLoop) {
+			CFRunLoopStop(runLoop);
+		}
+	}
+}
+
+static BOOL PSWaitForWiFiSSID(NSString *ssid, NSTimeInterval timeout) {
+	typedef SCDynamicStoreRef (*PSDStoreCreateCallbackFn)(CFAllocatorRef allocator, CFStringRef name, SCDynamicStoreCallBack callout, SCDynamicStoreContext *context);
+	typedef Boolean (*PSDStoreSetNotificationKeysFn)(SCDynamicStoreRef store, CFArrayRef keys, CFArrayRef patterns);
+	typedef CFRunLoopSourceRef (*PSDStoreCreateRunLoopSourceFn)(CFAllocatorRef allocator, SCDynamicStoreRef store, CFIndex order);
+	PSDStoreCreateCallbackFn storeCreate = (PSDStoreCreateCallbackFn)dlsym(RTLD_DEFAULT, "SCDynamicStoreCreate");
+	PSDStoreSetNotificationKeysFn setNotificationKeys = (PSDStoreSetNotificationKeysFn)dlsym(RTLD_DEFAULT, "SCDynamicStoreSetNotificationKeys");
+	PSDStoreCreateRunLoopSourceFn createRunLoopSource = (PSDStoreCreateRunLoopSourceFn)dlsym(RTLD_DEFAULT, "SCDynamicStoreCreateRunLoopSource");
+	if (!storeCreate || !setNotificationKeys || !createRunLoopSource) {
+		return NO;
+	}
+	if ([[[PSProxyManager sharedManager] currentWiFiSSID] isEqualToString:ssid]) {
+		return YES;
+	}
+	NSMutableDictionary *state = [@{
+		@"targetSSID": ssid,
+		@"matched": @NO,
+		@"runLoop": [NSValue valueWithPointer:CFRunLoopGetCurrent()]
+	} mutableCopy];
+	SCDynamicStoreContext context = {0, (__bridge void *)state, NULL, NULL, NULL};
+	SCDynamicStoreRef store = storeCreate(NULL, CFSTR("ProxySwitcherWiFiWait"), PSWiFiWaitCallback, &context);
+	if (!store) {
+		return NO;
+	}
+	NSArray *keys = @[@"State:/Network/Global/IPv4"];
+	NSArray *patterns = @[@"State:/Network/Interface/en0/.*", @"State:/Network/Service/.*/IPv4", @"State:/Network/Service/.*/Proxies"];
+	if (!setNotificationKeys(store, (__bridge CFArrayRef)keys, (__bridge CFArrayRef)patterns)) {
+		CFRelease(store);
+		return NO;
+	}
+	CFRunLoopSourceRef source = createRunLoopSource(NULL, store, 0);
+	if (!source) {
+		CFRelease(store);
+		return NO;
+	}
+	CFRunLoopAddSource(CFRunLoopGetCurrent(), source, kCFRunLoopDefaultMode);
+	NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
+	while (![state[@"matched"] boolValue]) {
+		NSTimeInterval remaining = [deadline timeIntervalSinceNow];
+		if (remaining <= 0) {
+			break;
+		}
+		CFRunLoopRunInMode(kCFRunLoopDefaultMode, remaining, true);
+		if ([[[PSProxyManager sharedManager] currentWiFiSSID] isEqualToString:ssid]) {
+			state[@"matched"] = @YES;
+		}
+	}
+	CFRunLoopRemoveSource(CFRunLoopGetCurrent(), source, kCFRunLoopDefaultMode);
+	CFRelease(source);
+	CFRelease(store);
+	return [state[@"matched"] boolValue];
+}
+#endif
+
 @implementation PSProxyProfile
 
 + (BOOL)supportsSecureCoding {
@@ -347,15 +459,34 @@ static BOOL PSSwitchToWiFiSSIDUsingCoreWiFi(NSString *ssid, NSError **error) {
 
 - (NSDictionary *)storeDictionary {
 	PSMigrateLegacyStoreIfNeeded();
-	NSDictionary *dictionary = [NSDictionary dictionaryWithContentsOfFile:PSStorePath()];
-	return [dictionary isKindOfClass:NSDictionary.class] ? dictionary : @{};
+	for (NSString *path in PSStorePathCandidates()) {
+		NSDictionary *dictionary = [NSDictionary dictionaryWithContentsOfFile:path];
+		if ([dictionary isKindOfClass:NSDictionary.class]) {
+			PSDebugWriteState(@{
+				@"phase": @"store-read",
+				@"path": path ?: @"",
+				@"profilesCount": @([[dictionary objectForKey:PSProfilesKey] isKindOfClass:NSArray.class] ? [(NSArray *)dictionary[PSProfilesKey] count] : 0),
+				@"quickWiFiCount": @([[dictionary objectForKey:PSQuickWiFiSSIDsKey] isKindOfClass:NSArray.class] ? [(NSArray *)dictionary[PSQuickWiFiSSIDsKey] count] : 0)
+			});
+			return dictionary;
+		}
+	}
+	PSDebugWriteState(@{
+		@"phase": @"store-read-empty"
+	});
+	return @{};
 }
 
 - (BOOL)writeStoreDictionary:(NSDictionary *)dictionary {
-	NSString *path = PSStorePath();
-	NSString *directory = [path stringByDeletingLastPathComponent];
-	[[NSFileManager defaultManager] createDirectoryAtPath:directory withIntermediateDirectories:YES attributes:nil error:nil];
-	BOOL ok = [dictionary writeToFile:path atomically:YES];
+	BOOL ok = NO;
+	NSFileManager *fileManager = [NSFileManager defaultManager];
+	for (NSString *path in PSStorePathCandidates()) {
+		NSString *directory = [path stringByDeletingLastPathComponent];
+		[fileManager createDirectoryAtPath:directory withIntermediateDirectories:YES attributes:nil error:nil];
+		if ([dictionary writeToFile:path atomically:YES]) {
+			ok = YES;
+		}
+	}
 	if (ok) {
 		notify_post(PSProxyProfilesChangedNotification.UTF8String);
 	}
@@ -540,6 +671,10 @@ static BOOL PSSwitchToWiFiSSIDUsingCoreWiFi(NSString *ssid, NSError **error) {
 	}
 	NSMutableDictionary *store = [self storeDictionary].mutableCopy;
 	NSMutableDictionary *mapping = [[store[PSWiFiServiceIdentifiersKey] isKindOfClass:NSDictionary.class] ? store[PSWiFiServiceIdentifiersKey] : @{} mutableCopy];
+	NSString *existing = [mapping[ssid] isKindOfClass:NSString.class] ? mapping[ssid] : nil;
+	if ([existing isEqualToString:serviceIdentifier]) {
+		return;
+	}
 	mapping[ssid] = serviceIdentifier;
 	store[PSWiFiServiceIdentifiersKey] = mapping;
 	[self writeStoreDictionary:store];
@@ -847,7 +982,7 @@ static BOOL PSSwitchToWiFiSSIDUsingCoreWiFi(NSString *ssid, NSError **error) {
 		return NO;
 	}
 #ifndef PROXYSWITCHER_HELPER
-	return [self runHelperWithArguments:@[@"wifi", ssid] timeout:30.0 response:nil error:error];
+	return [self runHelperWithArguments:@[@"wifi", ssid] timeout:PSProxyHelperWiFiTimeout response:nil error:error];
 #else
 	typedef CFTypeRef (*WiFiManagerClientCreateFn)(CFAllocatorRef allocator, int flags);
 	typedef CFArrayRef (*WiFiManagerClientCopyDevicesFn)(CFTypeRef manager);
@@ -906,17 +1041,7 @@ static BOOL PSSwitchToWiFiSSIDUsingCoreWiFi(NSString *ssid, NSError **error) {
 	if (!device || !targetNetwork) {
 		NSError *coreWiFiError = nil;
 		if (PSSwitchToWiFiSSIDUsingCoreWiFi(ssid, &coreWiFiError)) {
-			NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:15.0];
-			while ([deadline timeIntervalSinceNow] > 0) {
-				if ([[self currentWiFiSSID] isEqualToString:ssid]) {
-					[NSThread sleepForTimeInterval:1.0];
-					[self setWiFiServiceIdentifier:[self currentWiFiServiceIdentifier] forSSID:ssid];
-					[self syncActiveProfileWithCurrentSystemProxy:nil];
-					CFRelease(manager);
-					return YES;
-				}
-				[NSThread sleepForTimeInterval:0.5];
-			}
+			PSWaitForWiFiSSID(ssid, 15.0);
 			[self setWiFiServiceIdentifier:[self currentWiFiServiceIdentifier] forSSID:ssid];
 			[self syncActiveProfileWithCurrentSystemProxy:nil];
 			CFRelease(manager);
@@ -938,17 +1063,7 @@ static BOOL PSSwitchToWiFiSSIDUsingCoreWiFi(NSString *ssid, NSError **error) {
 		return NO;
 	}
 
-	NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:15.0];
-	while ([deadline timeIntervalSinceNow] > 0) {
-		if ([[self currentWiFiSSID] isEqualToString:ssid]) {
-			[NSThread sleepForTimeInterval:1.0];
-			[self setWiFiServiceIdentifier:[self currentWiFiServiceIdentifier] forSSID:ssid];
-			[self syncActiveProfileWithCurrentSystemProxy:nil];
-			CFRelease(manager);
-			return YES;
-		}
-		[NSThread sleepForTimeInterval:0.5];
-	}
+	PSWaitForWiFiSSID(ssid, 15.0);
 	[self setWiFiServiceIdentifier:[self currentWiFiServiceIdentifier] forSSID:ssid];
 	[self syncActiveProfileWithCurrentSystemProxy:nil];
 	CFRelease(manager);
@@ -962,7 +1077,7 @@ static BOOL PSSwitchToWiFiSSIDUsingCoreWiFi(NSString *ssid, NSError **error) {
 }
 
 - (BOOL)runHelperWithArguments:(NSArray<NSString *> *)arguments response:(NSString **)responseMessage error:(NSError **)error {
-	return [self runHelperWithArguments:arguments timeout:5.0 response:responseMessage error:error];
+	return [self runHelperWithArguments:arguments timeout:PSProxyHelperDefaultTimeout response:responseMessage error:error];
 }
 
 - (BOOL)runHelperWithArguments:(NSArray<NSString *> *)arguments timeout:(NSTimeInterval)timeout response:(NSString **)responseMessage error:(NSError **)error {
@@ -974,44 +1089,136 @@ static BOOL PSSwitchToWiFiSSIDUsingCoreWiFi(NSString *ssid, NSError **error) {
 		return NO;
 	}
 
-	NSString *requestIdentifier = [NSUUID UUID].UUIDString;
-	NSString *requestPath = PSRequestPath();
-	NSString *responsePath = PSResponsePath();
-	NSString *directory = [requestPath stringByDeletingLastPathComponent];
-	[[NSFileManager defaultManager] createDirectoryAtPath:directory withIntermediateDirectories:YES attributes:nil error:nil];
-	[[NSFileManager defaultManager] removeItemAtPath:responsePath error:nil];
-	NSString *request = [@[requestIdentifier, arguments.firstObject ?: @"", arguments.count > 1 ? arguments[1] : @""] componentsJoinedByString:@"\n"];
-	request = [request stringByAppendingString:@"\n"];
-	if (![request writeToFile:requestPath atomically:YES encoding:NSUTF8StringEncoding error:nil]) {
+	int socketFD = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (socketFD < 0) {
 		if (error) {
-			*error = [NSError errorWithDomain:@"ProxySwitcher" code:12 userInfo:@{NSLocalizedDescriptionKey: @"Unable to write helper request."}];
+			*error = [NSError errorWithDomain:@"ProxySwitcher" code:12 userInfo:@{NSLocalizedDescriptionKey: @"Unable to open helper socket."}];
 		}
 		return NO;
 	}
-	notify_post(PSProxyRequestNotification.UTF8String);
 
-	NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
-	while ([deadline timeIntervalSinceNow] > 0) {
-		NSString *response = [NSString stringWithContentsOfFile:responsePath encoding:NSUTF8StringEncoding error:nil];
-		NSArray<NSString *> *lines = [response componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet];
-		if (lines.count >= 2 && [lines[0] isEqualToString:requestIdentifier]) {
-			if ([lines[1] isEqualToString:@"1"]) {
-				if (responseMessage) {
-					*responseMessage = lines.count > 2 ? lines[2] : @"";
-				}
-				return YES;
-			}
+	struct timeval socketTimeout;
+	socketTimeout.tv_sec = (time_t)timeout;
+	socketTimeout.tv_usec = (suseconds_t)((timeout - socketTimeout.tv_sec) * 1000000.0);
+	setsockopt(socketFD, SOL_SOCKET, SO_RCVTIMEO, &socketTimeout, sizeof(socketTimeout));
+	setsockopt(socketFD, SOL_SOCKET, SO_SNDTIMEO, &socketTimeout, sizeof(socketTimeout));
+
+	struct sockaddr_un address;
+	BOOL connected = NO;
+	for (NSString *socketPath in PSHelperSocketPathCandidates()) {
+		memset(&address, 0, sizeof(address));
+		address.sun_family = AF_UNIX;
+		if (socketPath.length >= sizeof(address.sun_path)) {
+			continue;
+		}
+		strlcpy(address.sun_path, socketPath.fileSystemRepresentation, sizeof(address.sun_path));
+		if (connect(socketFD, (struct sockaddr *)&address, sizeof(address)) == 0) {
+			connected = YES;
+			break;
+		}
+	}
+	if (!connected) {
+		close(socketFD);
+		if (error) {
+			*error = [NSError errorWithDomain:@"ProxySwitcher" code:13 userInfo:@{NSLocalizedDescriptionKey: @"ProxySwitcher helper did not respond."}];
+		}
+		return NO;
+	}
+
+	NSDictionary *request = @{
+		@"command": arguments.firstObject ?: @"",
+		@"argument": arguments.count > 1 ? arguments[1] : @""
+	};
+	NSData *requestData = [NSJSONSerialization dataWithJSONObject:request options:0 error:nil];
+	if (!requestData) {
+		close(socketFD);
+		if (error) {
+			*error = [NSError errorWithDomain:@"ProxySwitcher" code:12 userInfo:@{NSLocalizedDescriptionKey: @"Unable to encode helper request."}];
+		}
+		return NO;
+	}
+	NSMutableData *lineData = [requestData mutableCopy];
+	[lineData appendData:[@"\n" dataUsingEncoding:NSUTF8StringEncoding]];
+	const uint8_t *bytes = lineData.bytes;
+	NSUInteger remaining = lineData.length;
+	while (remaining > 0) {
+		ssize_t written = write(socketFD, bytes, remaining);
+		if (written <= 0) {
+			close(socketFD);
 			if (error) {
-				NSString *message = lines.count > 2 && lines[2].length > 0 ? lines[2] : @"ProxySwitcher helper could not update proxy settings.";
-				*error = [NSError errorWithDomain:@"ProxySwitcher" code:11 userInfo:@{NSLocalizedDescriptionKey: message}];
+				*error = [NSError errorWithDomain:@"ProxySwitcher" code:12 userInfo:@{NSLocalizedDescriptionKey: @"Unable to write helper request."}];
 			}
 			return NO;
 		}
-		[NSThread sleepForTimeInterval:0.1];
+		bytes += written;
+		remaining -= (NSUInteger)written;
+	}
+	shutdown(socketFD, SHUT_WR);
+
+	NSMutableData *responseData = [NSMutableData data];
+	uint8_t buffer[1024];
+	BOOL sawNewline = NO;
+	while (responseData.length < PSProxyHelperMaxResponseLength) {
+		ssize_t count = read(socketFD, buffer, sizeof(buffer));
+		if (count < 0) {
+			close(socketFD);
+			if (error) {
+				*error = [NSError errorWithDomain:@"ProxySwitcher" code:13 userInfo:@{NSLocalizedDescriptionKey: @"ProxySwitcher helper did not respond."}];
+			}
+			return NO;
+		}
+		if (count == 0) {
+			break;
+		}
+		NSUInteger length = (NSUInteger)count;
+		for (NSUInteger index = 0; index < length; index++) {
+			if (buffer[index] == '\n') {
+				[responseData appendBytes:buffer length:index];
+				sawNewline = YES;
+				break;
+			}
+		}
+		if (sawNewline) {
+			break;
+		}
+		[responseData appendBytes:buffer length:length];
+	}
+	close(socketFD);
+
+	if (responseData.length == 0) {
+		if (error) {
+			*error = [NSError errorWithDomain:@"ProxySwitcher" code:13 userInfo:@{NSLocalizedDescriptionKey: @"ProxySwitcher helper did not respond."}];
+		}
+		return NO;
 	}
 
+	NSDictionary *response = [NSJSONSerialization JSONObjectWithData:responseData options:0 error:nil];
+	if (![response isKindOfClass:NSDictionary.class]) {
+		if (error) {
+			*error = [NSError errorWithDomain:@"ProxySwitcher" code:15 userInfo:@{NSLocalizedDescriptionKey: @"ProxySwitcher helper returned an invalid response."}];
+		}
+		return NO;
+	}
+	BOOL ok = [response[@"ok"] boolValue];
+	NSString *message = [response[@"message"] isKindOfClass:NSString.class] ? response[@"message"] : @"";
+	if (ok) {
+		if (responseMessage) {
+			*responseMessage = message ?: @"";
+		}
+		PSDebugWriteState(@{
+			@"phase": @"helper-ok",
+			@"command": arguments.firstObject ?: @"",
+			@"argument": arguments.count > 1 ? arguments[1] : @""
+		});
+		return YES;
+	}
+	PSDebugWriteState(@{
+		@"phase": @"helper-failed",
+		@"command": arguments.firstObject ?: @"",
+		@"message": message ?: @""
+	});
 	if (error) {
-		*error = [NSError errorWithDomain:@"ProxySwitcher" code:13 userInfo:@{NSLocalizedDescriptionKey: @"ProxySwitcher helper did not respond."}];
+		*error = [NSError errorWithDomain:@"ProxySwitcher" code:11 userInfo:@{NSLocalizedDescriptionKey: message.length > 0 ? message : @"ProxySwitcher helper could not update proxy settings."}];
 	}
 	return NO;
 }

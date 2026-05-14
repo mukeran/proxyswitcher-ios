@@ -10,6 +10,10 @@
 @property (nonatomic, strong) PSProxyProfile *temporaryProfile;
 @property (nonatomic, assign) int notifyToken;
 @property (nonatomic, assign) NSUInteger reloadGeneration;
+@property (nonatomic, assign) BOOL operationInProgress;
+@property (nonatomic, copy) NSString *pendingProxyIdentifier;
+@property (nonatomic, copy) NSString *pendingWiFiSSID;
+@property (nonatomic, copy) NSString *pendingOperationTitle;
 
 @end
 
@@ -105,29 +109,41 @@
 	if (indexPath.section == 0) {
 		PSProxyProfile *temporaryProfile = self.temporaryProfile;
 		content.text = @"Direct";
-		content.secondaryText = temporaryProfile ? [NSString stringWithFormat:@"Current Wi-Fi proxy: %@:%ld", temporaryProfile.host, (long)temporaryProfile.port] : @"No HTTP proxy";
-		cell.accessoryType = [activeIdentifier isEqualToString:PSProxyDirectIdentifier] ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
+		BOOL pending = [self.pendingProxyIdentifier isEqualToString:PSProxyDirectIdentifier];
+		content.secondaryText = pending ? @"Applying..." : (temporaryProfile ? [NSString stringWithFormat:@"Current Wi-Fi proxy: %@:%ld", temporaryProfile.host, (long)temporaryProfile.port] : @"No HTTP proxy");
+		cell.accessoryType = !pending && [activeIdentifier isEqualToString:PSProxyDirectIdentifier] ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
+		cell.accessoryView = pending ? [self activityAccessoryView] : nil;
 	} else if (indexPath.section == 1) {
 		PSProxyProfile *profile = self.profiles[indexPath.row];
+		BOOL pending = [self.pendingProxyIdentifier isEqualToString:profile.identifier];
 		content.text = profile.name;
-		content.secondaryText = [NSString stringWithFormat:@"%@:%ld", profile.host, (long)profile.port];
-		cell.accessoryType = [activeIdentifier isEqualToString:profile.identifier] ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
+		content.secondaryText = pending ? @"Applying..." : [NSString stringWithFormat:@"%@:%ld", profile.host, (long)profile.port];
+		cell.accessoryType = !pending && [activeIdentifier isEqualToString:profile.identifier] ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
+		cell.accessoryView = pending ? [self activityAccessoryView] : nil;
 	} else {
 		PSWiFiNetwork *network = self.wifiNetworks[indexPath.row];
+		BOOL pending = [self.pendingWiFiSSID isEqualToString:network.ssid];
 		content.text = network.displayName;
-		content.secondaryText = network.proxyProfile ? [NSString stringWithFormat:@"Saved proxy: %@:%ld", network.proxyProfile.host, (long)network.proxyProfile.port] : @"Saved proxy: Direct";
-		cell.accessoryType = network.current ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
+		content.secondaryText = pending ? @"Switching Wi-Fi..." : (network.proxyProfile ? [NSString stringWithFormat:@"Saved proxy: %@:%ld", network.proxyProfile.host, (long)network.proxyProfile.port] : @"Saved proxy: Direct");
+		cell.accessoryType = !pending && network.current ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
+		cell.accessoryView = pending ? [self activityAccessoryView] : nil;
 	}
 
+	cell.userInteractionEnabled = !self.operationInProgress;
+	cell.selectionStyle = self.operationInProgress ? UITableViewCellSelectionStyleNone : UITableViewCellSelectionStyleDefault;
 	cell.contentConfiguration = content;
 	return cell;
 }
 
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
 	[tableView deselectRowAtIndexPath:indexPath animated:YES];
+	if (self.operationInProgress) {
+		return;
+	}
 
 	void (^operation)(void) = nil;
 	if (indexPath.section == 0) {
+		[self beginOperationWithTitle:@"Applying Direct..." proxyIdentifier:PSProxyDirectIdentifier wifiSSID:nil];
 		operation = ^{
 			NSError *error;
 			BOOL ok = [[PSProxyManager sharedManager] applyDirectWithError:&error];
@@ -136,6 +152,7 @@
 	} else if (indexPath.section == 1) {
 		PSProxyProfile *profile = self.profiles[indexPath.row];
 		NSString *identifier = profile.identifier;
+		[self beginOperationWithTitle:[NSString stringWithFormat:@"Applying %@...", profile.name] proxyIdentifier:identifier wifiSSID:nil];
 		operation = ^{
 			NSError *error;
 			BOOL ok = [[PSProxyManager sharedManager] applyProfileWithIdentifier:identifier error:&error];
@@ -144,6 +161,7 @@
 	} else {
 		PSWiFiNetwork *network = self.wifiNetworks[indexPath.row];
 		NSString *ssid = network.ssid;
+		[self beginOperationWithTitle:[NSString stringWithFormat:@"Switching to %@...", network.displayName] proxyIdentifier:nil wifiSSID:ssid];
 		operation = ^{
 			NSError *error;
 			BOOL ok = [[PSProxyManager sharedManager] switchToWiFiSSID:ssid error:&error];
@@ -156,8 +174,30 @@
 	}
 }
 
+- (UIActivityIndicatorView *)activityAccessoryView {
+	UIActivityIndicatorView *activity = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
+	[activity startAnimating];
+	return activity;
+}
+
+- (void)beginOperationWithTitle:(NSString *)title proxyIdentifier:(NSString *)proxyIdentifier wifiSSID:(NSString *)wifiSSID {
+	self.operationInProgress = YES;
+	self.pendingOperationTitle = title;
+	self.pendingProxyIdentifier = proxyIdentifier;
+	self.pendingWiFiSSID = wifiSSID;
+	self.navigationItem.prompt = title;
+	self.navigationItem.rightBarButtonItem.enabled = NO;
+	[self.tableView reloadData];
+}
+
 - (void)finishOperationWithSuccess:(BOOL)ok error:(NSError *)error {
 	dispatch_async(dispatch_get_main_queue(), ^{
+		self.operationInProgress = NO;
+		self.pendingOperationTitle = nil;
+		self.pendingProxyIdentifier = nil;
+		self.pendingWiFiSSID = nil;
+		self.navigationItem.prompt = nil;
+		self.navigationItem.rightBarButtonItem.enabled = YES;
 		if (!ok) {
 			[self showError:error.localizedDescription ?: @"Unable to update settings."];
 		}
