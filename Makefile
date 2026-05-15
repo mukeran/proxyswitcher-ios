@@ -119,13 +119,16 @@ rename-package-roothide:
 .PHONY: package-rootful package-rootless package-roothide install-rootful install-rootless install-roothide
 
 package-rootful:
-	$(MAKE) all package THEOS_PACKAGE_SCHEME=rootful
+	$(MAKE) clean
+	$(MAKE) all package
 
 package-rootless:
+	$(MAKE) clean
 	$(MAKE) all package THEOS_PACKAGE_SCHEME=rootless
 	$(MAKE) rename-package-rootless
 
 package-roothide:
+	$(MAKE) clean
 	$(MAKE) all package THEOS_PACKAGE_SCHEME=roothide THEOS_PACKAGE_INSTALL_PREFIX=
 	$(MAKE) rename-package-roothide
 
@@ -152,10 +155,13 @@ package-nonjailbreak:
 package-app-only-rootless: package-nonjailbreak
 
 install-rootful:
-	$(MAKE) all install THEOS_PACKAGE_SCHEME=rootful
+	$(MAKE) clean
+	$(MAKE) all install
 
 install-rootless:
+	$(MAKE) clean
 	$(MAKE) all install THEOS_PACKAGE_SCHEME=rootless
 
 install-roothide:
+	$(MAKE) clean
 	$(MAKE) all install THEOS_PACKAGE_SCHEME=roothide THEOS_PACKAGE_INSTALL_PREFIX=

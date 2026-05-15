@@ -1,6 +1,6 @@
 Package: codes.var.tweak.proxyswitcher
 Name: ProxySwitcher
-Version: 0.1.0
+Version: 0.2.0
 Architecture: iphoneos-arm64
 Description: Quickly save and switch Wi-Fi HTTP proxy profiles from an app or Control Center.
 Maintainer: ProxySwitcher
