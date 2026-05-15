@@ -57,6 +57,15 @@ extern NSString * const PSProxyHelperSocketPath;
 - (BOOL)switchToWiFiSSID:(NSString *)ssid error:(NSError **)error;
 - (BOOL)syncActiveProfileWithCurrentSystemProxy:(NSError **)error;
 - (NSDictionary<NSString *, id> *)diagnosticsSnapshot;
+- (BOOL)isWiFiSwitchSupported;
+- (BOOL)isVPNModeAvailable;
+- (BOOL)isCompatibilityModeEnabled;
+- (void)setCompatibilityModeEnabled:(BOOL)enabled;
+- (BOOL)dispatchHelperCommand:(NSArray<NSString *> *)arguments error:(NSError **)error;
+
+- (nullable NSDictionary<NSString *, id> *)pendingAppCommand;
+- (void)setPendingAppCommand:(nullable NSDictionary<NSString *, id> *)command;
+- (void)clearPendingAppCommand;
 
 @end
 

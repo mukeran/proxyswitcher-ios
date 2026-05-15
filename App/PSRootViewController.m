@@ -53,6 +53,8 @@ static NSArray<NSString *> *PSAppNormalizeNoProxyList(NSString *rawText) {
 @property (nonatomic, copy) NSString *pendingWiFiSSID;
 @property (nonatomic, copy) NSString *pendingOperationTitle;
 @property (nonatomic, assign) BOOL reloadScheduled;
+@property (nonatomic, assign) BOOL compatibilityModeEnabled;
+@property (nonatomic, assign) BOOL vpnModeAvailable;
 
 @end
 
@@ -277,9 +279,13 @@ static NSArray<NSString *> *PSAppNormalizeNoProxyList(NSString *rawText) {
 	NSString *profiles = [self.snapshot[@"profilesCount"] respondsToSelector:@selector(stringValue)] ? [self.snapshot[@"profilesCount"] stringValue] : @"0";
 	NSString *wifi = [self.snapshot[@"quickWiFiCount"] respondsToSelector:@selector(stringValue)] ? [self.snapshot[@"quickWiFiCount"] stringValue] : @"0";
 	NSString *socket = [self.snapshot[@"helperSocketPath"] isKindOfClass:NSString.class] ? self.snapshot[@"helperSocketPath"] : @"";
+	NSString *mode = [self.snapshot[@"transportMode"] isKindOfClass:NSString.class] ? self.snapshot[@"transportMode"] : @"system";
+	NSString *compatibility = [self.snapshot[@"compatibilityModeEnabled"] boolValue] ? @"on" : @"off";
 	_items = @[
 		@{@"title": @"SSID", @"value": ssid},
 		@{@"title": @"Active", @"value": active},
+		@{@"title": @"Mode", @"value": mode},
+		@{@"title": @"Compat", @"value": compatibility},
 		@{@"title": @"Profiles", @"value": profiles},
 		@{@"title": @"Quick Wi-Fi", @"value": wifi},
 		@{@"title": @"Socket", @"value": socket},
@@ -309,7 +315,13 @@ static NSArray<NSString *> *PSAppNormalizeNoProxyList(NSString *rawText) {
 - (void)viewDidLoad {
 	[super viewDidLoad];
 	self.title = @"ProxySwitcher";
-	self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemAdd target:self action:@selector(showAddMenu)];
+	UIBarButtonItem *addButton = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemAdd target:self action:@selector(showAddMenu)];
+#if defined(PROXYSWITCHER_APP_ONLY)
+	self.navigationItem.rightBarButtonItems = @[addButton];
+#else
+	UIBarButtonItem *moreButton = [[UIBarButtonItem alloc] initWithImage:[UIImage systemImageNamed:@"ellipsis.circle"] style:UIBarButtonItemStylePlain target:self action:@selector(showMoreMenu)];
+	self.navigationItem.rightBarButtonItems = @[addButton, moreButton];
+#endif
 	self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithImage:[UIImage systemImageNamed:@"stethoscope"] style:UIBarButtonItemStylePlain target:self action:@selector(showDiagnostics)];
 	[self.tableView registerClass:UITableViewCell.class forCellReuseIdentifier:@"Cell"];
 	[NSNotificationCenter.defaultCenter addObserver:self selector:@selector(reloadProfiles) name:UIApplicationDidBecomeActiveNotification object:nil];
@@ -354,6 +366,8 @@ static NSArray<NSString *> *PSAppNormalizeNoProxyList(NSString *rawText) {
 		NSString *activeIdentifier = [manager activeIdentifier];
 		PSProxyProfile *temporaryProfile = [manager temporaryProfile];
 		PSProxyProfile *lastTemporaryProfile = [manager lastTemporaryProfile];
+		BOOL compatibilityModeEnabled = [manager isCompatibilityModeEnabled];
+		BOOL vpnModeAvailable = [manager isVPNModeAvailable];
 		dispatch_async(dispatch_get_main_queue(), ^{
 			if (generation != self.reloadGeneration) {
 				return;
@@ -363,6 +377,8 @@ static NSArray<NSString *> *PSAppNormalizeNoProxyList(NSString *rawText) {
 			self.activeIdentifier = activeIdentifier;
 			self.temporaryProfile = temporaryProfile;
 			self.lastTemporaryProfile = lastTemporaryProfile;
+			self.compatibilityModeEnabled = compatibilityModeEnabled;
+			self.vpnModeAvailable = vpnModeAvailable;
 			[self.tableView reloadData];
 		});
 	});
@@ -379,6 +395,9 @@ static NSArray<NSString *> *PSAppNormalizeNoProxyList(NSString *rawText) {
 	if (section == 1) {
 		return self.profiles.count;
 	}
+	if (![PSProxyManager sharedManager].isWiFiSwitchSupported) {
+		return 0;
+	}
 	return self.wifiNetworks.count;
 }
 
@@ -394,10 +413,16 @@ static NSArray<NSString *> *PSAppNormalizeNoProxyList(NSString *rawText) {
 
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
 	if (section == 0) {
-		return @"Tap Direct or a saved proxy to immediately update the active Wi-Fi HTTP proxy. If the current Wi-Fi uses a proxy that does not match a profile, it is shown here temporarily.";
+		if ([PSProxyManager sharedManager].isWiFiSwitchSupported) {
+			return @"Tap Direct or a saved proxy to immediately update the active Wi-Fi HTTP proxy. If the current Wi-Fi uses a proxy that does not match a profile, it is shown here temporarily.";
+		}
+		return @"Tap Direct or a saved proxy to update the in-app VPN proxy profile. This mode does not modify system Wi-Fi settings.";
 	}
 	if (section == 1) {
 		return self.profiles.count == 0 ? @"Add a proxy profile first. The Control Center module cycles through Direct and these profiles." : nil;
+	}
+	if (![PSProxyManager sharedManager].isWiFiSwitchSupported) {
+		return @"Wi-Fi switching is only available in Jailbreak mode.";
 	}
 	return self.wifiNetworks.count == 0 ? @"Add saved SSIDs here for quick switching." : @"Tap a saved SSID to join it. After the switch, ProxySwitcher follows the proxy configuration already saved by iOS for that Wi-Fi.";
 }
@@ -517,10 +542,18 @@ static NSArray<NSString *> *PSAppNormalizeNoProxyList(NSString *rawText) {
 		self.navigationItem.prompt = nil;
 		self.navigationItem.rightBarButtonItem.enabled = YES;
 		if (!ok) {
-			[self showError:error.localizedDescription ?: @"Unable to update settings."];
+			[self showError:[self formattedErrorMessage:error fallback:@"Unable to update settings."]];
 		}
 		[self reloadProfiles];
 	});
+}
+
+- (NSString *)formattedErrorMessage:(NSError *)error fallback:(NSString *)fallback {
+	if (!error) {
+		return fallback ?: @"Unable to update settings.";
+	}
+	NSString *description = error.localizedDescription.length > 0 ? error.localizedDescription : @"Unknown error";
+	return [NSString stringWithFormat:@"%@\n\nDomain: %@\nCode: %ld", description, error.domain ?: @"(none)", (long)error.code];
 }
 
 - (BOOL)tableView:(UITableView *)tableView canEditRowAtIndexPath:(NSIndexPath *)indexPath {
@@ -601,11 +634,58 @@ static NSArray<NSString *> *PSAppNormalizeNoProxyList(NSString *rawText) {
 	[alert addAction:[UIAlertAction actionWithTitle:@"Profile" style:UIAlertActionStyleDefault handler:^(__kindof UIAlertAction *action) {
 		[self showProfileEditorWithProfile:nil clearTemporaryOnSave:NO];
 	}]];
-	[alert addAction:[UIAlertAction actionWithTitle:@"Saved Wi-Fi" style:UIAlertActionStyleDefault handler:^(__kindof UIAlertAction *action) {
-		[self showWiFiPicker];
+	if ([PSProxyManager sharedManager].isWiFiSwitchSupported) {
+		[alert addAction:[UIAlertAction actionWithTitle:@"Saved Wi-Fi" style:UIAlertActionStyleDefault handler:^(__kindof UIAlertAction *action) {
+			[self showWiFiPicker];
+		}]];
+	}
+	[alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+	[self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)showMoreMenu {
+	UIAlertController *alert = [UIAlertController alertControllerWithTitle:nil message:nil preferredStyle:UIAlertControllerStyleActionSheet];
+#if !defined(PROXYSWITCHER_APP_ONLY)
+	if (self.vpnModeAvailable) {
+		[alert addAction:[UIAlertAction actionWithTitle:@"Mode" style:UIAlertActionStyleDefault handler:^(__kindof UIAlertAction *action) {
+			[self showModeSelectionDialog];
+		}]];
+	}
+#endif
+	[alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+	[self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)showModeSelectionDialog {
+	UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Mode" message:@"Choose proxy control mode." preferredStyle:UIAlertControllerStyleActionSheet];
+	[alert addAction:[UIAlertAction actionWithTitle:@"Jailbreak (Tweak)" style:UIAlertActionStyleDefault handler:^(__kindof UIAlertAction *action) {
+		[self setCompatibilityMode:NO];
+	}]];
+	[alert addAction:[UIAlertAction actionWithTitle:@"Non-jailbreak (VPN)" style:UIAlertActionStyleDefault handler:^(__kindof UIAlertAction *action) {
+		[self setCompatibilityMode:YES];
 	}]];
 	[alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
 	[self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)setCompatibilityMode:(BOOL)enabled {
+	if (enabled == self.compatibilityModeEnabled) {
+		return;
+	}
+	[self beginOperationWithTitle:(enabled ? @"Switching to VPN mode..." : @"Switching to System mode...") proxyIdentifier:nil wifiSSID:nil];
+	dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+		PSProxyManager *manager = [PSProxyManager sharedManager];
+		if (!enabled) {
+			// While compatibility mode is still enabled, this stops VPN transport only.
+			[manager applyDirectWithError:nil];
+		}
+		[manager setCompatibilityModeEnabled:enabled];
+		if (!enabled) {
+			// Refresh active state from current Wi-Fi system proxy instead of forcing Direct.
+			[manager syncActiveProfileWithCurrentSystemProxy:nil];
+		}
+		[self finishOperationWithSuccess:YES error:nil];
+	});
 }
 
 - (void)showWiFiPicker {

@@ -2,6 +2,8 @@
 #import "../Shared/PSProxyManager.h"
 #import <ControlCenterUIKit/CCUIMenuModuleItemView.h>
 #import <notify.h>
+#import <objc/message.h>
+#import <dlfcn.h>
 
 static UIImage *transparentImage() {
     UIGraphicsBeginImageContextWithOptions(CGSizeMake(24, 24), NO, 0.0);
@@ -12,11 +14,64 @@ static UIImage *transparentImage() {
 
 @implementation PSCCMenuViewController {
     int _notifyToken;
+    int _operationNotifyToken;
     NSMutableIndexSet *_sectionActionIndexes;
     NSUInteger _openAppActionIndex;
     NSUInteger _statusActionIndex;
+    NSUInteger _operationSerial;
     BOOL _operationInProgress;
     NSString *_operationTitle;
+}
+
+static BOOL PSLaunchAppByBundleIdentifier(NSString *bundleIdentifier) {
+    if (![bundleIdentifier isKindOfClass:NSString.class] || bundleIdentifier.length == 0) {
+        return NO;
+    }
+    Class workspaceClass = NSClassFromString(@"LSApplicationWorkspace");
+    if (workspaceClass && [workspaceClass respondsToSelector:@selector(defaultWorkspace)]) {
+        id workspace = ((id (*)(id, SEL))objc_msgSend)(workspaceClass, @selector(defaultWorkspace));
+        SEL openSelector = NSSelectorFromString(@"openApplicationWithBundleID:");
+        if (workspace && [workspace respondsToSelector:openSelector]) {
+            BOOL ok = ((BOOL (*)(id, SEL, id))objc_msgSend)(workspace, openSelector, bundleIdentifier);
+            if (ok) {
+                return YES;
+            }
+        }
+        SEL openWithConfigurationSelector = NSSelectorFromString(@"openApplicationWithBundleID:configuration:completionHandler:");
+        if (workspace && [workspace respondsToSelector:openWithConfigurationSelector]) {
+            ((void (*)(id, SEL, id, id, id))objc_msgSend)(workspace, openWithConfigurationSelector, bundleIdentifier, nil, nil);
+            return YES;
+        }
+        SEL openUsingConfigurationSelector = NSSelectorFromString(@"openApplicationWithBundleID:usingConfiguration:completionHandler:");
+        if (workspace && [workspace respondsToSelector:openUsingConfigurationSelector]) {
+            ((void (*)(id, SEL, id, id, id))objc_msgSend)(workspace, openUsingConfigurationSelector, bundleIdentifier, nil, nil);
+            return YES;
+        }
+    }
+
+    void *handle = dlopen("/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices", RTLD_LAZY);
+    if (handle) {
+        typedef int (*SBSLaunchApplicationWithIdentifierFn)(CFStringRef identifier, BOOL suspended);
+        SBSLaunchApplicationWithIdentifierFn fn = (SBSLaunchApplicationWithIdentifierFn)dlsym(handle, "SBSLaunchApplicationWithIdentifier");
+        if (fn) {
+            int result = fn((__bridge CFStringRef)bundleIdentifier, NO);
+            dlclose(handle);
+            return result == 0;
+        }
+        dlclose(handle);
+    }
+    return NO;
+}
+
+static void PSLaunchAppByBundleIdentifierAsync(NSString *bundleIdentifier, void (^completion)(BOOL launched)) {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        BOOL launched = PSLaunchAppByBundleIdentifier(bundleIdentifier);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (completion) {
+                completion(launched);
+            }
+        });
+    });
 }
 
 - (void)willTransitionToExpandedContentMode:(BOOL)expanded {
@@ -40,6 +95,7 @@ static UIImage *transparentImage() {
     [self refreshState];
     __weak typeof(self) weakSelf = self;
     notify_register_dispatch(PSProxyProfilesChangedNotification.UTF8String, &_notifyToken, dispatch_get_main_queue(), ^(int token) {
+        [weakSelf refreshActions];
         [weakSelf refreshState];
     });
 }
@@ -58,6 +114,9 @@ static UIImage *transparentImage() {
 - (void)dealloc {
     if (_notifyToken) {
         notify_cancel(_notifyToken);
+    }
+    if (_operationNotifyToken) {
+        notify_cancel(_operationNotifyToken);
     }
 }
 
@@ -84,12 +143,27 @@ static UIImage *transparentImage() {
     if (_operationInProgress) {
         return;
     }
-    [self beginOperationWithTitle:@"Applying Direct..."];
+    PSProxyManager *manager = [PSProxyManager sharedManager];
+    if ([manager isCompatibilityModeEnabled]) {
+        [self beginOperationWithTitle:@"Switching via App..." waitForNotification:YES];
+        [self dispatchURLAction:@"proxyswitcher://direct"];
+        return;
+    }
+    [self beginOperationWithTitle:@"Applying Direct..." waitForNotification:NO];
     __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         NSError *error;
-        [[PSProxyManager sharedManager] applyDirectWithError:&error];
+        BOOL ok = [manager applyDirectWithError:&error];
         dispatch_async(dispatch_get_main_queue(), ^{
+            if (!ok && [manager isCompatibilityModeEnabled]) {
+                [manager setPendingAppCommand:@{
+                    @"action": @"direct",
+                    @"source": @"cc"
+                }];
+                [weakSelf beginOperationWithTitle:@"Opening App..." waitForNotification:YES];
+                [weakSelf openAppByBundleIdentifier];
+                return;
+            }
             [weakSelf finishOperation];
         });
     });
@@ -99,13 +173,31 @@ static UIImage *transparentImage() {
     if (_operationInProgress) {
         return;
     }
+    PSProxyManager *manager = [PSProxyManager sharedManager];
+    if ([manager isCompatibilityModeEnabled]) {
+        NSString *encodedIdentifier = [profile.identifier stringByAddingPercentEncodingWithAllowedCharacters:NSCharacterSet.URLQueryAllowedCharacterSet];
+        NSString *urlString = [NSString stringWithFormat:@"proxyswitcher://apply?id=%@", encodedIdentifier ?: @""];
+        [self beginOperationWithTitle:[NSString stringWithFormat:@"Switching %@ via App...", profile.name] waitForNotification:YES];
+        [self dispatchURLAction:urlString];
+        return;
+    }
     NSString *identifier = profile.identifier;
-    [self beginOperationWithTitle:[NSString stringWithFormat:@"Applying %@...", profile.name]];
+    [self beginOperationWithTitle:[NSString stringWithFormat:@"Applying %@...", profile.name] waitForNotification:NO];
     __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         NSError *error;
-        [[PSProxyManager sharedManager] applyProfileWithIdentifier:identifier error:&error];
+        BOOL ok = [manager applyProfileWithIdentifier:identifier error:&error];
         dispatch_async(dispatch_get_main_queue(), ^{
+            if (!ok && [manager isCompatibilityModeEnabled]) {
+                [manager setPendingAppCommand:@{
+                    @"action": @"apply",
+                    @"identifier": profile.identifier ?: @"",
+                    @"source": @"cc"
+                }];
+                [weakSelf beginOperationWithTitle:@"Opening App..." waitForNotification:YES];
+                [weakSelf openAppByBundleIdentifier];
+                return;
+            }
             [weakSelf finishOperation];
         });
     });
@@ -116,7 +208,7 @@ static UIImage *transparentImage() {
         return;
     }
     NSString *ssid = network.ssid;
-    [self beginOperationWithTitle:[NSString stringWithFormat:@"Switching to %@...", network.displayName]];
+    [self beginOperationWithTitle:[NSString stringWithFormat:@"Switching to %@...", network.displayName] waitForNotification:NO];
     __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         NSError *error;
@@ -127,14 +219,43 @@ static UIImage *transparentImage() {
     });
 }
 
-- (void)beginOperationWithTitle:(NSString *)title {
+- (void)beginOperationWithTitle:(NSString *)title waitForNotification:(BOOL)waitForNotification {
+    _operationSerial += 1;
     _operationInProgress = YES;
     _operationTitle = [title copy];
+    if (_operationNotifyToken) {
+        notify_cancel(_operationNotifyToken);
+        _operationNotifyToken = 0;
+    }
+    if (waitForNotification) {
+        NSUInteger operationSerial = _operationSerial;
+        __weak typeof(self) weakSelf = self;
+        notify_register_dispatch(PSProxyProfilesChangedNotification.UTF8String, &_operationNotifyToken, dispatch_get_main_queue(), ^(int token) {
+            #pragma unused(token)
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf || operationSerial != strongSelf->_operationSerial || !strongSelf->_operationInProgress) {
+                return;
+            }
+            [strongSelf finishOperation];
+        });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf || operationSerial != strongSelf->_operationSerial || !strongSelf->_operationInProgress) {
+                return;
+            }
+            [[PSProxyManager sharedManager] clearPendingAppCommand];
+            [strongSelf finishOperation];
+        });
+    }
     [self refreshActions];
     [self refreshState];
 }
 
 - (void)finishOperation {
+    if (_operationNotifyToken) {
+        notify_cancel(_operationNotifyToken);
+        _operationNotifyToken = 0;
+    }
     _operationInProgress = NO;
     _operationTitle = nil;
     [self refreshActions];
@@ -143,6 +264,33 @@ static UIImage *transparentImage() {
 
 - (void)openApp {
     NSURL *url = [NSURL URLWithString:@"proxyswitcher://"];
+    [self dispatchURL:url];
+}
+
+- (void)dispatchURLAction:(NSString *)urlString {
+    if (![urlString isKindOfClass:NSString.class] || urlString.length == 0) {
+        return;
+    }
+    NSURL *url = [NSURL URLWithString:urlString];
+    [self dispatchURL:url];
+}
+
+- (void)openAppByBundleIdentifier {
+    __weak typeof(self) weakSelf = self;
+    PSLaunchAppByBundleIdentifierAsync(@"codes.var.tweak.proxyswitcher", ^(BOOL launched) {
+        if (launched) {
+            return;
+        }
+        NSLog(@"[ProxySwitcherCC] Failed to launch app by bundle id.");
+        [[PSProxyManager sharedManager] clearPendingAppCommand];
+        [weakSelf finishOperation];
+    });
+}
+
+- (void)dispatchURL:(NSURL *)url {
+    if (![url isKindOfClass:NSURL.class]) {
+        return;
+    }
     Class applicationClass = NSClassFromString(@"UIApplication");
     id application = [applicationClass respondsToSelector:@selector(sharedApplication)] ? [applicationClass sharedApplication] : nil;
     if (!application) {
@@ -239,11 +387,13 @@ static UIImage *transparentImage() {
     _openAppActionIndex = NSNotFound;
     _statusActionIndex = NSNotFound;
     
-    NSArray<PSProxyProfile *> *profiles = [[PSProxyManager sharedManager] profiles];
-    NSArray<PSWiFiNetwork *> *wifiNetworks = [[PSProxyManager sharedManager] quickWiFiNetworks];
-    NSString *activeIdentifier = [[PSProxyManager sharedManager] activeIdentifier];
-    PSProxyProfile *temporaryProfile = [[PSProxyManager sharedManager] temporaryProfile];
-    NSString *currentSSID = [[PSProxyManager sharedManager] currentWiFiSSID];
+    PSProxyManager *manager = [PSProxyManager sharedManager];
+    NSArray<PSProxyProfile *> *profiles = [manager profiles];
+    NSArray<PSWiFiNetwork *> *wifiNetworks = [manager quickWiFiNetworks];
+    BOOL wifiSwitchSupported = [manager isWiFiSwitchSupported] && ![manager isCompatibilityModeEnabled];
+    NSString *activeIdentifier = [manager activeIdentifier];
+    PSProxyProfile *temporaryProfile = [manager temporaryProfile];
+    NSString *currentSSID = [manager currentWiFiSSID];
     
     __weak typeof(self) weakSelf = self;
 
@@ -276,7 +426,7 @@ static UIImage *transparentImage() {
         }];
     }
 
-    if (wifiNetworks.count > 0) {
+    if (wifiSwitchSupported && wifiNetworks.count > 0) {
         [self addSectionTitle:@"📶  WI-FI"];
         for (PSWiFiNetwork *network in wifiNetworks) {
             UIImage *glyph = transparentImage();
@@ -304,12 +454,19 @@ static UIImage *transparentImage() {
     if (_operationInProgress) {
         return;
     }
+    PSProxyManager *manager = [PSProxyManager sharedManager];
+    if ([manager isCompatibilityModeEnabled]) {
+        [self beginOperationWithTitle:@"Toggling via App..." waitForNotification:YES];
+        [self dispatchURLAction:@"proxyswitcher://toggle"];
+        [super buttonTapped:arg1 forEvent:arg2];
+        return;
+    }
     BOOL selected = !self.selected;
     NSString *targetIdentifier = nil;
     if (selected) {
-        NSString *lastIdentifier = [[PSProxyManager sharedManager] lastActiveProfileIdentifier];
+        NSString *lastIdentifier = [manager lastActiveProfileIdentifier];
         if (!lastIdentifier) {
-            NSArray<PSProxyProfile *> *profiles = [[PSProxyManager sharedManager] profiles];
+            NSArray<PSProxyProfile *> *profiles = [manager profiles];
             if (profiles.count > 0) {
                 lastIdentifier = profiles.firstObject.identifier;
             }
@@ -319,13 +476,13 @@ static UIImage *transparentImage() {
         }
     }
     __weak typeof(self) weakSelf = self;
-    [self beginOperationWithTitle:targetIdentifier ? @"Applying proxy..." : @"Applying Direct..."];
+    [self beginOperationWithTitle:targetIdentifier ? @"Applying proxy..." : @"Applying Direct..." waitForNotification:NO];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         NSError *error;
         if (targetIdentifier) {
-            [[PSProxyManager sharedManager] applyProfileWithIdentifier:targetIdentifier error:&error];
+            [manager applyProfileWithIdentifier:targetIdentifier error:&error];
         } else {
-            [[PSProxyManager sharedManager] applyDirectWithError:&error];
+            [manager applyDirectWithError:&error];
         }
         dispatch_async(dispatch_get_main_queue(), ^{
             [weakSelf finishOperation];

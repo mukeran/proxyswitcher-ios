@@ -9,7 +9,21 @@
 #import <sys/un.h>
 #import <unistd.h>
 
+static BOOL RunVPNApply(NSString *profileIdentifier, NSError **error) {
+	return [[PSProxyManager sharedManager] applyProfileWithIdentifier:profileIdentifier error:error];
+}
+
+static BOOL RunVPNDirect(NSError **error) {
+	return [[PSProxyManager sharedManager] applyDirectWithError:error];
+}
+
 static BOOL RunCommand(NSString *command, NSString *profileIdentifier, NSError **error) {
+	if ([command isEqualToString:@"vpn-apply"] && profileIdentifier.length > 0) {
+		return RunVPNApply(profileIdentifier, error);
+	}
+	if ([command isEqualToString:@"vpn-direct"]) {
+		return RunVPNDirect(error);
+	}
 	if ([command isEqualToString:@"direct"]) {
 		return [[PSProxyManager sharedManager] applyDirectWithError:error];
 	}
