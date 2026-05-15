@@ -9,6 +9,8 @@ PACKAGE_VERSION = $(THEOS_PACKAGE_BASE_VERSION)$(VERSION.EXTRAVERSION)
 PROXYSWITCHER_APP_ONLY ?= 0
 ifeq ($(PROXYSWITCHER_APP_ONLY),1)
 ARCHS = arm64
+else ifeq ($(THEOS_PACKAGE_SCHEME),roothide)
+ARCHS = arm64e
 else
 ARCHS = arm64 arm64e
 endif
@@ -90,6 +92,11 @@ before-package::
 ifeq ($(PROXYSWITCHER_APP_ONLY),0)
 	$(ECHO_NOTHING)cp "layout/DEBIAN/postinst" "$(THEOS_STAGING_DIR)/DEBIAN/postinst"$(ECHO_END)
 	$(ECHO_NOTHING)chmod 0755 "$(THEOS_STAGING_DIR)/DEBIAN/postinst"$(ECHO_END)
+endif
+ifeq ($(THEOS_PACKAGE_SCHEME),roothide)
+	$(ECHO_NOTHING)if [ -f "$(THEOS_STAGING_DIR)/DEBIAN/control" ]; then \
+		sed -i '' -E 's/^(Architecture:[[:space:]]*).*/\1iphoneos-arm64e/' "$(THEOS_STAGING_DIR)/DEBIAN/control"; \
+	fi$(ECHO_END)
 endif
 
 .PHONY: rename-package-rootless rename-package-roothide
