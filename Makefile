@@ -56,6 +56,10 @@ ProxySwitcherTunnel_RESOURCE_FILES = Tunnel/Info.plist
 
 include $(THEOS_MAKE_PATH)/appex.mk
 
+.PHONY: appicon
+appicon:
+	./scripts/generate-appicon.sh
+
 before-all::
 	$(ECHO_NOTHING)./scripts/prepare-tun2http-ios.sh$(ECHO_END)
 
@@ -160,9 +164,7 @@ package-rootless:
 	$(MAKE) rename-package-rootless PACKAGE_ARCH=iphoneos-arm64e
 
 package-roothide:
-	$(MAKE) clean
-	$(MAKE) all package THEOS_PACKAGE_SCHEME=roothide THEOS_PACKAGE_INSTALL_PREFIX=
-	$(MAKE) rename-package-roothide
+	@./scripts/package-roothide.sh
 
 .PHONY: package-nonjailbreak
 package-nonjailbreak:

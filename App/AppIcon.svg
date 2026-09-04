@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="180" height="180" viewBox="0 0 180 180">
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#126984"/>
+      <stop offset="0.48" stop-color="#14938b"/>
+      <stop offset="1" stop-color="#18b194"/>
+    </linearGradient>
+    <radialGradient id="cyan-glow" cx="0.32" cy="0.31" r="0.62">
+      <stop offset="0" stop-color="#28a4ac" stop-opacity="0.78"/>
+      <stop offset="0.72" stop-color="#2ab0b1" stop-opacity="0.18"/>
+      <stop offset="1" stop-color="#2ab0b1" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="top-right-tone" cx="1" cy="0" r="0.7">
+      <stop offset="0" stop-color="#1eac9c" stop-opacity="0.18"/>
+      <stop offset="1" stop-color="#1eac9c" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="bottom-left-tone" cx="0" cy="1" r="0.8">
+      <stop offset="0" stop-color="#0f7380" stop-opacity="0.3"/>
+      <stop offset="1" stop-color="#0f7380" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <rect width="180" height="180" fill="url(#background)"/>
+  <rect width="180" height="180" fill="url(#cyan-glow)"/>
+  <rect width="180" height="180" fill="url(#top-right-tone)"/>
+  <rect width="180" height="180" fill="url(#bottom-left-tone)"/>
+
+  <rect x="31.4375" y="62.125" width="117.125" height="16.1875" rx="8.09375" fill="#f8ffff"/>
+  <circle cx="77.375" cy="70.25" r="17.125" fill="#f8ffff"/>
+
+  <circle cx="109.8125" cy="111.625" r="17.125" fill="#84eed2"/>
+  <rect x="31.4375" y="103.5625" width="117.125" height="16.1875" rx="8.09375" fill="#f8ffff"/>
+</svg>
